@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Score Translation Progress</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>Score Translation Progress</h1>
+
+      <section class="card">
+        <dl class="meta">
+          <div>
+            <dt>Filename</dt>
+            <dd>{{ manifest.original_filename }}</dd>
+          </div>
+          <div>
+            <dt>Target language</dt>
+            <dd>{{ manifest.target_language }}</dd>
+          </div>
+        </dl>
+
+        <p id="status-message">{{ manifest.message }}</p>
+        <p id="stage-summary" class="small">Step 1 of 5: Queued</p>
+        <ol id="stage-tracker" class="stage-tracker" aria-label="Processing stages">
+          <li class="stage-item is-active" data-stage-id="queued">
+            <span class="stage-dot" aria-hidden="true"></span>
+            <span class="stage-label">Queued</span>
+          </li>
+          <li class="stage-item is-upcoming" data-stage-id="extracting">
+            <span class="stage-dot" aria-hidden="true"></span>
+            <span class="stage-label">Preparing score pages</span>
+          </li>
+          <li class="stage-item is-upcoming" data-stage-id="translating">
+            <span class="stage-dot" aria-hidden="true"></span>
+            <span class="stage-label">Translating text</span>
+          </li>
+          <li class="stage-item is-upcoming" data-stage-id="rebuilding">
+            <span class="stage-dot" aria-hidden="true"></span>
+            <span class="stage-label">Building translated PDF</span>
+          </li>
+          <li class="stage-item is-upcoming" data-stage-id="ready">
+            <span class="stage-dot" aria-hidden="true"></span>
+            <span class="stage-label">Ready to download</span>
+          </li>
+        </ol>
+        <div class="progress" aria-label="Processing progress">
+          <div
+            id="progress-bar"
+            class="progress-bar"
+            style="width: {{ (manifest.progress * 100) | round | int }}%"
+          ></div>
+        </div>
+        <p id="progress-percent" class="small">{{ (manifest.progress * 100) | round | int }}%</p>
+        <p id="batch-message" class="small"></p>
+
+        <div id="result-area" class="hidden">
+          <a id="download-link" class="button-link" href="#">Download translated PDF</a>
+          <a id="download-log-link" class="button-link secondary-action hidden" href="#"
+            >Download LLM request log (JSON)</a
+          >
+        </div>
+
+        <div id="error-area" class="error hidden" role="alert"></div>
+      </section>
+
+      <p><a href="/">Translate another PDF</a></p>
+    </main>
+    <script>
+      window.jobConfig = {
+        statusUrl: "{{ status_url }}",
+        initialPayload: {{ {
+          "status": manifest.status,
+          "message": manifest.message,
+          "progress": manifest.progress,
+          "current_batch": manifest.current_batch,
+          "total_batches": manifest.total_batches,
+          "download_url": None,
+          "log_url": None,
+          "error": manifest.error,
+        } | tojson }},
+      };
+    </script>
+    <script src="/static/job.js" defer></script>
+  </body>
+</html>
+

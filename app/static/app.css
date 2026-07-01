@@ -1,0 +1,262 @@
+:root {
+  color-scheme: light;
+  --bg: #f7f7f9;
+  --card: #ffffff;
+  --text: #1f2328;
+  --muted: #616b75;
+  --accent: #2f6feb;
+  --accent-focus: #1f4db5;
+  --danger: #b42318;
+  --border: #d0d7de;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.container {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 2.5rem;
+}
+
+h1 {
+  margin-top: 0;
+}
+
+.lead {
+  color: var(--muted);
+}
+
+.privacy-note {
+  padding: 0.7rem 0.9rem;
+  background: #fff8d4;
+  border: 1px solid #ead894;
+  border-radius: 8px;
+}
+
+.card {
+  margin-top: 1rem;
+  padding: 1rem;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--card);
+}
+
+.drop-zone {
+  border: 2px dashed #9da7b2;
+  border-radius: 10px;
+  padding: 1rem;
+  text-align: center;
+}
+
+.drop-zone.drag-over {
+  border-color: var(--accent);
+  background: #eef4ff;
+}
+
+.selected-file {
+  font-weight: 600;
+}
+
+.field {
+  margin-top: 1rem;
+}
+
+.testing-toggle-field {
+  margin-top: 1.15rem;
+}
+
+.inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.inline-check input[type="checkbox"] {
+  width: 1.05rem;
+  height: 1.05rem;
+}
+
+.testing-panel {
+  margin-top: 1rem;
+  border: 1px solid #ccd7e5;
+  border-radius: 10px;
+  background: #f5f9ff;
+  padding: 0.9rem;
+}
+
+label {
+  display: inline-block;
+  margin-bottom: 0.35rem;
+  font-weight: 600;
+}
+
+select,
+input[type="text"],
+input[type="number"] {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 1rem;
+  padding: 0.6rem 0.7rem;
+  background: #fff;
+}
+
+button,
+.button-link {
+  margin-top: 1rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  text-decoration: none;
+  font-weight: 600;
+  padding: 0.65rem 1rem;
+  cursor: pointer;
+}
+
+.button-link.secondary-action {
+  margin-left: 0.6rem;
+  background: #e6edf8;
+  color: #10244a;
+}
+
+button.secondary {
+  background: #e6edf8;
+  color: #10244a;
+}
+
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+.drop-zone:focus-visible,
+a:focus-visible {
+  outline: 3px solid var(--accent-focus);
+  outline-offset: 2px;
+}
+
+button[disabled] {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.meta {
+  margin: 0 0 1rem;
+  padding: 0;
+}
+
+.meta div {
+  margin-bottom: 0.45rem;
+}
+
+.meta dt {
+  font-weight: 700;
+}
+
+.meta dd {
+  margin: 0.1rem 0 0;
+}
+
+.small {
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.stage-tracker {
+  margin: 0.6rem 0 1rem;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.stage-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+}
+
+.stage-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid #b5bec8;
+  background: transparent;
+  flex-shrink: 0;
+}
+
+.stage-item.is-complete {
+  color: #27436f;
+}
+
+.stage-item.is-complete .stage-dot {
+  border-color: #2f6feb;
+  background: #2f6feb;
+}
+
+.stage-item.is-active {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.stage-item.is-active .stage-dot {
+  border-color: #2f6feb;
+  box-shadow: 0 0 0 3px #d9e7ff;
+}
+
+.stage-item.is-failed {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.stage-item.is-failed .stage-dot {
+  border-color: var(--danger);
+  background: #fef2f2;
+}
+
+.progress {
+  width: 100%;
+  height: 14px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #eaedf0;
+  border: 1px solid #d8dee4;
+}
+
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #2f6feb, #4f8ff8);
+  width: 0%;
+  transition: width 0.2s ease;
+}
+
+.error {
+  margin-top: 0.8rem;
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.hidden {
+  display: none !important;
+}
+
+@media (max-width: 640px) {
+  .container {
+    padding: 1rem 0.8rem 2rem;
+  }
+}
+

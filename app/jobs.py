@@ -1,0 +1,558 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import shutil
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from time import perf_counter
+
+from app.config import Settings
+from app.models import (
+    BatchLLMLogEntry,
+    JobLLMLog,
+    JobManifest,
+    JobStatus,
+    TranslationPlacement,
+    positions_for_variant,
+)
+from app.openai_service import OpenAIService, OpenAIServiceError, PermanentOpenAIError
+from app.pdf_processing import (
+    PDFValidationError,
+    build_batches,
+    build_output_filename,
+    clean_and_filter_batch_placements,
+    create_translated_pdf,
+    merge_batch_results,
+    position_order_for_variant,
+    render_pdf_pages_to_images,
+    sanitize_stem,
+    validate_pdf_upload,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+
+class JobStore:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.root = settings.job_root
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def _manifest_path(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "manifest.json"
+
+    def job_dir(self, job_id: str) -> Path:
+        validated = self.validate_job_id(job_id)
+        directory = (self.root / validated).resolve()
+        root_resolved = self.root.resolve()
+        if root_resolved not in directory.parents and directory != root_resolved:
+            raise ValueError("Invalid job path.")
+        return directory
+
+    def input_pdf_path(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "input.pdf"
+
+    def rendered_dir(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "rendered"
+
+    def output_pdf_path(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "output.pdf"
+
+    def translation_json_path(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "translation.json"
+
+    def llm_log_json_path(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "llm_log.json"
+
+    @staticmethod
+    def validate_job_id(raw_job_id: str) -> str:
+        try:
+            parsed = uuid.UUID(raw_job_id)
+        except Exception as exc:
+            raise ValueError("Invalid job id.") from exc
+        return str(parsed)
+
+    def create_job(
+        self,
+        *,
+        original_filename: str,
+        target_language: str,
+        page_count: int,
+        llm_provider: str,
+        llm_model: str | None,
+        positioning_variant: str,
+        testing_mode: bool,
+        owned_batch_size_override: int | None = None,
+        context_pages_override: int | None = None,
+    ) -> JobManifest:
+        job_id = str(uuid.uuid4())
+        directory = self.job_dir(job_id)
+        directory.mkdir(parents=True, exist_ok=False)
+        expires_at = datetime.now(tz=timezone.utc) + timedelta(minutes=self.settings.job_ttl_minutes)
+        manifest = JobManifest(
+            job_id=job_id,
+            original_filename=original_filename,
+            safe_original_stem=sanitize_stem(original_filename),
+            target_language=target_language,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            positioning_variant=positioning_variant,
+            testing_mode=testing_mode,
+            owned_batch_size_override=owned_batch_size_override,
+            context_pages_override=context_pages_override,
+            page_count=page_count,
+            expires_at=expires_at,
+        )
+        self._write_manifest(manifest)
+        LOGGER.info(
+            (
+                "Created job job_id=%s filename=%s target_language=%s page_count=%s "
+                "testing_mode=%s provider=%s selected_model=%s positioning_variant=%s "
+                "selected_owned_batch_size=%s selected_context_pages=%s "
+                "effective_owned_batch_size=%s effective_context_pages=%s expires_at=%s"
+            ),
+            manifest.job_id,
+            manifest.original_filename,
+            manifest.target_language,
+            manifest.page_count,
+            manifest.testing_mode,
+            manifest.llm_provider,
+            manifest.llm_model or "default",
+            manifest.positioning_variant,
+            manifest.owned_batch_size_override if manifest.owned_batch_size_override is not None else "default",
+            manifest.context_pages_override if manifest.context_pages_override is not None else "default",
+            manifest.owned_batch_size_override
+            if manifest.owned_batch_size_override is not None
+            else self.settings.owned_batch_size,
+            manifest.context_pages_override
+            if manifest.context_pages_override is not None
+            else self.settings.context_pages,
+            manifest.expires_at.isoformat(),
+        )
+        return manifest
+
+    def _write_manifest(self, manifest: JobManifest) -> None:
+        path = self._manifest_path(manifest.job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(
+            manifest.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+
+    def get_job(self, job_id: str) -> JobManifest | None:
+        try:
+            valid_job_id = self.validate_job_id(job_id)
+        except ValueError:
+            return None
+        path = self._manifest_path(valid_job_id)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return JobManifest.model_validate(payload)
+        except Exception:
+            LOGGER.exception("Failed to read manifest job_id=%s", valid_job_id)
+            return None
+
+    def require_job(self, job_id: str) -> JobManifest:
+        manifest = self.get_job(job_id)
+        if manifest is None:
+            raise FileNotFoundError("Job not found.")
+        return manifest
+
+    def update_job(self, job_id: str, **updates: object) -> JobManifest:
+        manifest = self.require_job(job_id)
+        for key, value in updates.items():
+            setattr(manifest, key, value)
+        manifest.touch()
+        self._write_manifest(manifest)
+        return manifest
+
+    def set_status(
+        self,
+        *,
+        job_id: str,
+        status: JobStatus,
+        message: str,
+        progress: float,
+        current_batch: int | None = None,
+        total_batches: int | None = None,
+        error: str | None = None,
+    ) -> JobManifest:
+        progress = min(1.0, max(0.0, progress))
+        manifest = self.update_job(
+            job_id,
+            status=status,
+            message=message,
+            progress=progress,
+            current_batch=current_batch,
+            total_batches=total_batches,
+            error=error,
+        )
+        LOGGER.info(
+            "Job status job_id=%s status=%s progress=%.1f%% message=%s batch=%s/%s",
+            job_id,
+            status.value,
+            progress * 100,
+            message,
+            current_batch if current_batch is not None else "-",
+            total_batches if total_batches is not None else "-",
+        )
+        return manifest
+
+    def mark_complete(self, *, job_id: str, download_filename: str) -> JobManifest:
+        manifest = self.update_job(
+            job_id,
+            status=JobStatus.COMPLETE,
+            message="Translation complete.",
+            progress=1.0,
+            current_batch=None,
+            total_batches=None,
+            error=None,
+            download_filename=download_filename,
+        )
+        LOGGER.info(
+            "Job complete job_id=%s download_filename=%s",
+            job_id,
+            download_filename,
+        )
+        return manifest
+
+    def mark_failed(self, *, job_id: str, message: str) -> JobManifest:
+        manifest = self.update_job(
+            job_id,
+            status=JobStatus.FAILED,
+            message="Processing failed.",
+            error=message,
+            current_batch=None,
+            total_batches=None,
+        )
+        LOGGER.warning("Job failed job_id=%s message=%s", job_id, message)
+        return manifest
+
+    def cleanup_expired(self) -> int:
+        now = datetime.now(tz=timezone.utc)
+        removed = 0
+        self.root.mkdir(parents=True, exist_ok=True)
+        for directory in self.root.iterdir():
+            if not directory.is_dir():
+                continue
+            manifest_path = directory / "manifest.json"
+            expire = None
+            if manifest_path.exists():
+                try:
+                    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    manifest = JobManifest.model_validate(payload)
+                    expire = manifest.expires_at
+                except Exception:
+                    LOGGER.warning("Could not parse manifest during cleanup path=%s", directory)
+            if expire is None:
+                modified = datetime.fromtimestamp(directory.stat().st_mtime, tz=timezone.utc)
+                expire = modified + timedelta(minutes=self.settings.job_ttl_minutes)
+            if expire < now:
+                shutil.rmtree(directory, ignore_errors=True)
+                removed += 1
+                LOGGER.info("Removed expired job directory path=%s", directory)
+        return removed
+
+
+def _sort_batch_placements(
+    placements: list[TranslationPlacement],
+    position_order: dict[str, int],
+) -> list[TranslationPlacement]:
+    return sorted(placements, key=lambda item: (item.page, position_order.get(item.position, 999)))
+
+
+async def process_job(
+    *,
+    job_store: JobStore,
+    settings: Settings,
+    openai_service: OpenAIService,
+    job_id: str,
+) -> None:
+    started = perf_counter()
+    manifest = job_store.require_job(job_id)
+    position_order = position_order_for_variant(manifest.positioning_variant)
+    allowed_positions = set(positions_for_variant(manifest.positioning_variant))
+    owned_batch_size = (
+        manifest.owned_batch_size_override
+        if manifest.owned_batch_size_override is not None
+        else settings.owned_batch_size
+    )
+    context_pages = (
+        manifest.context_pages_override
+        if manifest.context_pages_override is not None
+        else settings.context_pages
+    )
+    LOGGER.info(
+        (
+            "Starting job job_id=%s page_count=%s target_language=%s testing_mode=%s "
+            "provider=%s selected_model=%s position_variant=%s "
+            "selected_batch_size=%s selected_context_pages=%s "
+            "effective_batch_size=%s effective_context_pages=%s "
+            "render_dpi=%s image_max_dimension=%s max_parallel_batches=%s"
+        ),
+        job_id,
+        manifest.page_count,
+        manifest.target_language,
+        manifest.testing_mode,
+        manifest.llm_provider,
+        manifest.llm_model or "default",
+        manifest.positioning_variant,
+        manifest.owned_batch_size_override if manifest.owned_batch_size_override is not None else "default",
+        manifest.context_pages_override if manifest.context_pages_override is not None else "default",
+        owned_batch_size,
+        context_pages,
+        settings.image_dpi,
+        settings.image_max_dimension,
+        settings.max_parallel_batches,
+    )
+
+    try:
+        job_store.set_status(
+            job_id=job_id,
+            status=JobStatus.VALIDATING,
+            message="Validating uploaded PDF...",
+            progress=0.02,
+        )
+        input_pdf_path = job_store.input_pdf_path(job_id)
+        payload = input_pdf_path.read_bytes()
+        page_count = validate_pdf_upload(
+            filename=manifest.original_filename,
+            payload=payload,
+            max_upload_bytes=settings.max_upload_bytes,
+            max_pages=settings.max_pages,
+        )
+        job_store.update_job(job_id, page_count=page_count)
+
+        job_store.set_status(
+            job_id=job_id,
+            status=JobStatus.RENDERING,
+            message="Rendering pages for recognition...",
+            progress=0.08,
+        )
+        rendered_paths = render_pdf_pages_to_images(
+            pdf_path=input_pdf_path,
+            output_dir=job_store.rendered_dir(job_id),
+            dpi=settings.image_dpi,
+            max_dimension=settings.image_max_dimension,
+        )
+        if len(rendered_paths) != page_count:
+            raise RuntimeError("Rendered page count does not match source PDF page count.")
+        LOGGER.info(
+            "Rendered pages job_id=%s page_count=%s render_dir=%s",
+            job_id,
+            len(rendered_paths),
+            job_store.rendered_dir(job_id),
+        )
+
+        job_store.set_status(
+            job_id=job_id,
+            status=JobStatus.RENDERING,
+            message="Rendered score pages.",
+            progress=0.25,
+        )
+        batches = build_batches(
+            total_pages=page_count,
+            owned_batch_size=owned_batch_size,
+            context_pages=context_pages,
+        )
+        max_parallel_batches = max(1, settings.max_parallel_batches)
+        LOGGER.info(
+            "Prepared batches job_id=%s total_batches=%s max_parallel_batches=%s",
+            job_id,
+            len(batches),
+            max_parallel_batches,
+        )
+
+        total_batches = len(batches)
+        llm_entries_by_index: dict[int, BatchLLMLogEntry] = {}
+        placement_groups_by_index: dict[int, list[TranslationPlacement]] = {}
+
+        async def _run_single_batch(batch_spec) -> tuple[int, int, int, list[TranslationPlacement], BatchLLMLogEntry]:
+            LOGGER.info(
+                "Running batch job_id=%s batch=%s owned=%s-%s supplied=%s-%s",
+                job_id,
+                batch_spec.index,
+                batch_spec.owned_start,
+                batch_spec.owned_end,
+                batch_spec.supplied_start,
+                batch_spec.supplied_end,
+            )
+            batch_result, batch_log = await openai_service.translate_batch(
+                batch=batch_spec,
+                target_language=manifest.target_language,
+                image_paths=rendered_paths,
+                provider=manifest.llm_provider,
+                model_name=manifest.llm_model,
+                position_variant=manifest.positioning_variant,
+            )
+            filtered = clean_and_filter_batch_placements(
+                placements=batch_result.placements,
+                batch=batch_spec,
+                allowed_positions=allowed_positions,
+                logger=LOGGER,
+            )
+            LOGGER.info(
+                "Batch complete job_id=%s batch=%s filtered_placements=%s",
+                job_id,
+                batch_spec.index,
+                len(filtered),
+            )
+            return (
+                batch_spec.index,
+                batch_spec.owned_start,
+                batch_spec.owned_end,
+                _sort_batch_placements(filtered, position_order),
+                batch_log,
+            )
+
+        if total_batches:
+            job_store.set_status(
+                job_id=job_id,
+                status=JobStatus.ANALYSING,
+                message="Analysing score pages...",
+                progress=0.25,
+                current_batch=0,
+                total_batches=total_batches,
+            )
+            semaphore = asyncio.Semaphore(max_parallel_batches)
+            completed_batches = 0
+            tasks: list[asyncio.Task[tuple[int, int, int, list[TranslationPlacement], BatchLLMLogEntry]]] = []
+
+            async def _run_with_limit(batch_spec):
+                async with semaphore:
+                    return await _run_single_batch(batch_spec)
+
+            tasks = [asyncio.create_task(_run_with_limit(batch_spec)) for batch_spec in batches]
+            try:
+                for completed_task in asyncio.as_completed(tasks):
+                    (
+                        batch_index,
+                        owned_start,
+                        owned_end,
+                        sorted_placements,
+                        batch_log,
+                    ) = await completed_task
+                    placement_groups_by_index[batch_index] = sorted_placements
+                    llm_entries_by_index[batch_index] = batch_log
+                    completed_batches += 1
+                    batch_progress = 0.25 + completed_batches / total_batches * 0.60
+                    job_store.set_status(
+                        job_id=job_id,
+                        status=JobStatus.ANALYSING,
+                        message=f"Analysed pages {owned_start}-{owned_end}.",
+                        progress=batch_progress,
+                        current_batch=completed_batches,
+                        total_batches=total_batches,
+                    )
+            except Exception:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+        ordered_batch_indexes = sorted(placement_groups_by_index)
+        placement_groups = [placement_groups_by_index[index] for index in ordered_batch_indexes]
+        llm_entries = [llm_entries_by_index[index] for index in ordered_batch_indexes]
+
+        merged = merge_batch_results(
+            target_language=manifest.target_language,
+            position_order=position_order,
+            placement_groups=placement_groups,
+        )
+        job_store.translation_json_path(job_id).write_text(
+            merged.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        LOGGER.info(
+            "Merged translation job_id=%s total_placements=%s",
+            job_id,
+            len(merged.placements),
+        )
+        total_input_tokens = sum(entry.input_tokens or 0 for entry in llm_entries)
+        total_output_tokens = sum(entry.output_tokens or 0 for entry in llm_entries)
+        total_tokens = sum(entry.total_tokens or 0 for entry in llm_entries)
+        total_cost = round(sum(entry.total_cost_usd for entry in llm_entries), 8)
+        llm_log = JobLLMLog(
+            job_id=job_id,
+            provider=manifest.llm_provider,
+            model=manifest.llm_model or (
+                settings.openai_model
+                if manifest.llm_provider == "openai"
+                else settings.gemini_model
+                if manifest.llm_provider == "gemini"
+                else settings.deepseek_model
+            ),
+            reasoning_effort=(
+                settings.openai_reasoning_effort if manifest.llm_provider == "openai" else None
+            ),
+            source_pdf_page_count=page_count,
+            total_batches=total_batches,
+            total_pages_sent=sum(entry.pages_sent_count for entry in llm_entries),
+            totals={
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "total_tokens": total_tokens,
+                "total_cost_usd": total_cost,
+            },
+            entries=llm_entries,
+        )
+        job_store.llm_log_json_path(job_id).write_text(
+            llm_log.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        LOGGER.info(
+            "Saved LLM request log job_id=%s path=%s total_cost_usd=%.6f",
+            job_id,
+            job_store.llm_log_json_path(job_id),
+            total_cost,
+        )
+
+        job_store.set_status(
+            job_id=job_id,
+            status=JobStatus.CREATING_PDF,
+            message="Creating translated PDF...",
+            progress=0.90,
+            current_batch=None,
+            total_batches=total_batches if total_batches else None,
+        )
+        output_path = job_store.output_pdf_path(job_id)
+        create_translated_pdf(
+            original_pdf_path=input_pdf_path,
+            output_pdf_path=output_path,
+            translation_result=merged,
+            output_font_size=settings.output_font_size,
+            min_font_size=settings.min_font_size,
+            output_background_opacity=settings.output_background_opacity,
+            position_variant=manifest.positioning_variant,
+        )
+        download_filename = build_output_filename(
+            manifest.safe_original_stem,
+            manifest.target_language,
+        )
+        job_store.mark_complete(job_id=job_id, download_filename=download_filename)
+    except PDFValidationError as exc:
+        LOGGER.warning("Validation failed job_id=%s reason=%s", job_id, exc)
+        job_store.mark_failed(job_id=job_id, message=str(exc))
+    except PermanentOpenAIError as exc:
+        LOGGER.warning("Provider non-retryable failure job_id=%s reason=%s", job_id, exc)
+        job_store.mark_failed(job_id=job_id, message="Selected provider could not process this score.")
+    except OpenAIServiceError as exc:
+        LOGGER.warning("Provider failure job_id=%s reason=%s", job_id, exc)
+        job_store.mark_failed(job_id=job_id, message="Temporary provider error. Please retry.")
+    except Exception:
+        LOGGER.exception("Unexpected processing error job_id=%s", job_id)
+        job_store.mark_failed(
+            job_id=job_id,
+            message="Unexpected server error while processing the score.",
+        )
+    finally:
+        elapsed = perf_counter() - started
+        LOGGER.info("Finished job job_id=%s duration_s=%.2f", job_id, elapsed)
+

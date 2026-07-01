@@ -1,0 +1,16 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - score_jobs:/tmp/score-translator
+    restart: unless-stopped
+
+volumes:
+  score_jobs:
+

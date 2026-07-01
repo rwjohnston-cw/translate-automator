@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vocal Score Translator</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>Vocal Score Translator</h1>
+      <p class="lead">
+        Upload a vocal or choral score PDF, translate sung text, and download a new PDF with
+        translated overlays.
+      </p>
+      <p class="privacy-note">
+        Privacy note: rendered score page images are sent to the selected LLM provider for lyric recognition and
+        translation.
+      </p>
+
+      <form id="upload-form" class="card" novalidate>
+        <div
+          id="drop-zone"
+          class="drop-zone"
+          tabindex="0"
+          role="button"
+          aria-label="Drop PDF file here or choose file"
+        >
+          <p>Drag and drop a PDF here</p>
+          <p class="small">or</p>
+          <button type="button" id="pick-file-btn" class="secondary">Choose PDF</button>
+          <input
+            type="file"
+            id="pdf-file"
+            name="pdf_file"
+            accept="application/pdf,.pdf"
+            required
+            hidden
+          />
+          <p id="selected-file" class="selected-file" aria-live="polite">No file selected</p>
+          <p class="small">Maximum upload size: {{ max_upload_mb }} MB</p>
+        </div>
+
+        <div class="field">
+          <label for="target-language">Target language</label>
+          <select id="target-language" name="target_language" required>
+            <option value="">Choose a language</option>
+            {% for option in language_options %}
+            <option value="{{ option }}">{{ option }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <div class="field hidden" id="custom-language-wrapper">
+          <label for="custom-target-language">Custom target language</label>
+          <input
+            id="custom-target-language"
+            name="custom_target_language"
+            type="text"
+            maxlength="80"
+            autocomplete="off"
+          />
+        </div>
+
+        <div class="field testing-toggle-field">
+          <label class="inline-check" for="testing-mode">
+            <input id="testing-mode" name="testing_mode" type="checkbox" />
+            Enable testing mode (provider/model/positioning options)
+          </label>
+        </div>
+
+        <section id="testing-panel" class="testing-panel hidden" aria-label="Testing mode options">
+          <div class="field">
+            <label for="llm-provider">LLM provider</label>
+            <select id="llm-provider" name="llm_provider">
+              {% for option in provider_options %}
+              <option value="{{ option.value }}">{{ option.label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="llm-model">Model</label>
+            <select id="llm-model-select"></select>
+            <input
+              id="llm-model-custom"
+              name="llm_model"
+              type="text"
+              maxlength="120"
+              autocomplete="off"
+              placeholder="Or type a custom model id"
+            />
+            <p class="small">Choose a preset or enter your own model identifier.</p>
+          </div>
+
+          <div class="field">
+            <label for="positioning-variant">Page positioning variant</label>
+            <select id="positioning-variant" name="positioning_variant">
+              {% for option in position_variant_options %}
+              <option value="{{ option.value }}">{{ option.label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="owned-batch-size">Owned batch size</label>
+            <input
+              id="owned-batch-size"
+              name="owned_batch_size"
+              type="number"
+              min="1"
+              max="1000"
+              step="1"
+              value="{{ default_owned_batch_size }}"
+            />
+            <p class="small">How many pages each batch owns (default: {{ default_owned_batch_size }}).</p>
+          </div>
+
+          <div class="field">
+            <label for="context-pages">Context pages</label>
+            <input
+              id="context-pages"
+              name="context_pages"
+              type="number"
+              min="0"
+              max="1000"
+              step="1"
+              value="{{ default_context_pages }}"
+            />
+            <p class="small">Previous/next context pages to include per batch (default: {{ default_context_pages }}).</p>
+          </div>
+        </section>
+
+        <button id="submit-btn" type="submit">Translate score</button>
+        <div id="form-error" class="error" role="alert" aria-live="assertive"></div>
+      </form>
+    </main>
+    <script id="model-options-data" type="application/json">{{ model_options_json | safe }}</script>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
+
