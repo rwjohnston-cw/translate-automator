@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import shutil
@@ -8,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
+from typing import Any
 
 try:
     import redis
@@ -81,6 +83,12 @@ class JobStore:
     def llm_log_json_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "llm_log.json"
 
+    def checkpoint_dir(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "checkpoints"
+
+    def checkpoint_path(self, job_id: str, batch_index: int) -> Path:
+        return self.checkpoint_dir(job_id) / f"batch_{batch_index:04d}.json"
+
     def _redis_manifest_key(self, job_id: str) -> str:
         return f"{self.redis_key_prefix}:job:{job_id}:manifest"
 
@@ -89,6 +97,15 @@ class JobStore:
 
     def _redis_log_key(self, job_id: str) -> str:
         return f"{self.redis_key_prefix}:job:{job_id}:llm_log"
+
+    def _redis_input_key(self, job_id: str) -> str:
+        return f"{self.redis_key_prefix}:job:{job_id}:input_pdf"
+
+    def _redis_checkpoint_hash_key(self, job_id: str) -> str:
+        return f"{self.redis_key_prefix}:job:{job_id}:batch_checkpoints"
+
+    def _redis_processing_lock_key(self, job_id: str) -> str:
+        return f"{self.redis_key_prefix}:job:{job_id}:processing_lock"
 
     def _redis_ttl_seconds(self, manifest: JobManifest) -> int:
         seconds = int((manifest.expires_at - datetime.now(tz=timezone.utc)).total_seconds())
@@ -335,6 +352,26 @@ class JobStore:
         except Exception:
             LOGGER.exception("Failed to persist output artifact to redis job_id=%s", job_id)
 
+    def persist_input_pdf_artifact(self, *, job_id: str, payload: bytes | None = None) -> None:
+        if self.redis_client is None:
+            return
+        manifest = self.get_job(job_id)
+        if manifest is None:
+            return
+        if payload is None:
+            input_path = self.input_pdf_path(job_id)
+            if not input_path.exists():
+                return
+            payload = input_path.read_bytes()
+        try:
+            self.redis_client.set(
+                self._redis_input_key(job_id),
+                payload,
+                ex=self._redis_ttl_seconds(manifest),
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist input artifact to redis job_id=%s", job_id)
+
     def get_cached_output_pdf(self, job_id: str) -> bytes | None:
         if self.redis_client is None:
             return None
@@ -343,6 +380,16 @@ class JobStore:
             return payload if payload is not None else None
         except Exception:
             LOGGER.exception("Failed to read output artifact from redis job_id=%s", job_id)
+            return None
+
+    def get_cached_input_pdf(self, job_id: str) -> bytes | None:
+        if self.redis_client is None:
+            return None
+        try:
+            payload = self.redis_client.get(self._redis_input_key(job_id))
+            return payload if payload is not None else None
+        except Exception:
+            LOGGER.exception("Failed to read input artifact from redis job_id=%s", job_id)
             return None
 
     def get_cached_llm_log(self, job_id: str) -> bytes | None:
@@ -354,6 +401,118 @@ class JobStore:
         except Exception:
             LOGGER.exception("Failed to read llm log artifact from redis job_id=%s", job_id)
             return None
+
+    def create_processing_lock(self, job_id: str):
+        if self.redis_client is None:
+            return None
+        timeout = max(30, self.settings.job_processing_lock_ttl_seconds)
+        return self.redis_client.lock(
+            self._redis_processing_lock_key(job_id),
+            timeout=timeout,
+            blocking=False,
+        )
+
+    def save_batch_checkpoint(
+        self,
+        *,
+        job_id: str,
+        batch_index: int,
+        owned_start: int,
+        owned_end: int,
+        placements: list[TranslationPlacement],
+        full_translation: str,
+        batch_log: BatchLLMLogEntry,
+    ) -> None:
+        payload = {
+            "batch_index": batch_index,
+            "owned_start": owned_start,
+            "owned_end": owned_end,
+            "placements": [item.model_dump() for item in placements],
+            "full_translation": full_translation,
+            "batch_log": batch_log.model_dump(),
+        }
+        manifest = self.get_job(job_id)
+
+        path = self.checkpoint_path(job_id, batch_index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
+        if self.redis_client is None:
+            return
+        if manifest is None:
+            return
+        try:
+            self.redis_client.hset(
+                self._redis_checkpoint_hash_key(job_id),
+                str(batch_index),
+                json.dumps(payload).encode("utf-8"),
+            )
+            self.redis_client.expire(
+                self._redis_checkpoint_hash_key(job_id),
+                self._redis_ttl_seconds(manifest),
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist batch checkpoint to redis job_id=%s batch=%s", job_id, batch_index)
+
+    def _parse_checkpoint_payload(
+        self, payload: dict[str, Any]
+    ) -> tuple[int, list[TranslationPlacement], str, BatchLLMLogEntry]:
+        batch_index = int(payload["batch_index"])
+        placements_raw = payload.get("placements") or []
+        placements = [TranslationPlacement.model_validate(item) for item in placements_raw]
+        full_translation = str(payload.get("full_translation") or "")
+        batch_log = BatchLLMLogEntry.model_validate(payload["batch_log"])
+        return batch_index, placements, full_translation, batch_log
+
+    def load_batch_checkpoints(
+        self, job_id: str
+    ) -> dict[int, tuple[list[TranslationPlacement], str, BatchLLMLogEntry]]:
+        checkpoints: dict[int, tuple[list[TranslationPlacement], str, BatchLLMLogEntry]] = {}
+        checkpoint_dir = self.checkpoint_dir(job_id)
+        if checkpoint_dir.exists():
+            for path in sorted(checkpoint_dir.glob("batch_*.json")):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    index, placements, full_translation, batch_log = self._parse_checkpoint_payload(payload)
+                    checkpoints[index] = (placements, full_translation, batch_log)
+                except Exception:
+                    LOGGER.exception("Failed to parse local checkpoint path=%s", path)
+
+        if self.redis_client is None:
+            return checkpoints
+        try:
+            raw_map = self.redis_client.hgetall(self._redis_checkpoint_hash_key(job_id))
+        except Exception:
+            LOGGER.exception("Failed to read checkpoints from redis job_id=%s", job_id)
+            return checkpoints
+
+        for raw_index, raw_payload in raw_map.items():
+            try:
+                payload = json.loads(raw_payload.decode("utf-8"))
+                index, placements, full_translation, batch_log = self._parse_checkpoint_payload(payload)
+                if index not in checkpoints:
+                    checkpoints[index] = (placements, full_translation, batch_log)
+            except Exception:
+                LOGGER.exception(
+                    "Failed to parse redis checkpoint job_id=%s batch=%s",
+                    job_id,
+                    raw_index.decode("utf-8", errors="ignore")
+                    if isinstance(raw_index, (bytes, bytearray))
+                    else raw_index,
+                )
+        return checkpoints
+
+    def clear_batch_checkpoints(self, job_id: str) -> None:
+        checkpoint_dir = self.checkpoint_dir(job_id)
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)
+        if self.redis_client is not None:
+            try:
+                self.redis_client.delete(self._redis_checkpoint_hash_key(job_id))
+            except Exception:
+                LOGGER.exception("Failed to clear redis checkpoints job_id=%s", job_id)
 
     def cleanup_expired(self) -> int:
         now = datetime.now(tz=timezone.utc)
@@ -396,6 +555,31 @@ async def process_job(
     job_id: str,
 ) -> None:
     started = perf_counter()
+    processing_lock = job_store.create_processing_lock(job_id)
+    lock_heartbeat_task: asyncio.Task[None] | None = None
+    if processing_lock is not None:
+        try:
+            acquired = bool(processing_lock.acquire(blocking=False))
+        except Exception:
+            LOGGER.exception("Failed to acquire processing lock job_id=%s", job_id)
+            return
+        if not acquired:
+            LOGGER.info("Processing already active elsewhere job_id=%s", job_id)
+            return
+
+        heartbeat_interval = max(5, settings.job_processing_lock_heartbeat_seconds)
+        lock_ttl = max(30, settings.job_processing_lock_ttl_seconds)
+
+        async def _refresh_processing_lock() -> None:
+            while True:
+                await asyncio.sleep(heartbeat_interval)
+                try:
+                    processing_lock.extend(lock_ttl, replace_ttl=True)
+                except Exception:
+                    LOGGER.exception("Failed to extend processing lock job_id=%s", job_id)
+
+        lock_heartbeat_task = asyncio.create_task(_refresh_processing_lock())
+
     manifest = job_store.require_job(job_id)
     position_order = position_order_for_variant(manifest.positioning_variant)
     allowed_positions = set(positions_for_variant(manifest.positioning_variant))
@@ -441,6 +625,13 @@ async def process_job(
             progress=0.02,
         )
         input_pdf_path = job_store.input_pdf_path(job_id)
+        if not input_pdf_path.exists():
+            cached_input = job_store.get_cached_input_pdf(job_id)
+            if cached_input is None:
+                raise FileNotFoundError("Input PDF is unavailable for this job.")
+            input_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            input_pdf_path.write_bytes(cached_input)
+            LOGGER.info("Restored input PDF from redis job_id=%s", job_id)
         payload = input_pdf_path.read_bytes()
         page_count = validate_pdf_upload(
             filename=manifest.original_filename,
@@ -495,6 +686,22 @@ async def process_job(
         placement_groups_by_index: dict[int, list[TranslationPlacement]] = {}
         full_translations_by_index: dict[int, str] = {}
 
+        checkpoints = job_store.load_batch_checkpoints(job_id)
+        for checkpoint_index, (placements, full_translation, batch_log) in checkpoints.items():
+            placement_groups_by_index[checkpoint_index] = placements
+            full_translations_by_index[checkpoint_index] = full_translation
+            llm_entries_by_index[checkpoint_index] = batch_log
+
+        pending_batches = [batch for batch in batches if batch.index not in placement_groups_by_index]
+        completed_batches = len(placement_groups_by_index)
+        if completed_batches:
+            LOGGER.info(
+                "Resuming job from checkpoints job_id=%s completed_batches=%s total_batches=%s",
+                job_id,
+                completed_batches,
+                total_batches,
+            )
+
         async def _run_single_batch(
             batch_spec,
         ) -> tuple[int, int, int, list[TranslationPlacement], str, BatchLLMLogEntry]:
@@ -540,51 +747,64 @@ async def process_job(
             job_store.set_status(
                 job_id=job_id,
                 status=JobStatus.ANALYSING,
-                message="Analysing score pages...",
-                progress=0.25,
-                current_batch=0,
+                message=(
+                    "Resuming translation from saved checkpoints..."
+                    if completed_batches
+                    else "Analysing score pages..."
+                ),
+                progress=0.25 + (completed_batches / total_batches * 0.60),
+                current_batch=completed_batches,
                 total_batches=total_batches,
             )
-            semaphore = asyncio.Semaphore(max_parallel_batches)
-            completed_batches = 0
-            tasks: list[
-                asyncio.Task[tuple[int, int, int, list[TranslationPlacement], str, BatchLLMLogEntry]]
-            ] = []
+            if pending_batches:
+                semaphore = asyncio.Semaphore(max_parallel_batches)
+                tasks: list[
+                    asyncio.Task[tuple[int, int, int, list[TranslationPlacement], str, BatchLLMLogEntry]]
+                ] = []
 
-            async def _run_with_limit(batch_spec):
-                async with semaphore:
-                    return await _run_single_batch(batch_spec)
+                async def _run_with_limit(batch_spec):
+                    async with semaphore:
+                        return await _run_single_batch(batch_spec)
 
-            tasks = [asyncio.create_task(_run_with_limit(batch_spec)) for batch_spec in batches]
-            try:
-                for completed_task in asyncio.as_completed(tasks):
-                    (
-                        batch_index,
-                        owned_start,
-                        owned_end,
-                        sorted_placements,
-                        full_translation,
-                        batch_log,
-                    ) = await completed_task
-                    placement_groups_by_index[batch_index] = sorted_placements
-                    full_translations_by_index[batch_index] = full_translation
-                    llm_entries_by_index[batch_index] = batch_log
-                    completed_batches += 1
-                    batch_progress = 0.25 + completed_batches / total_batches * 0.60
-                    job_store.set_status(
-                        job_id=job_id,
-                        status=JobStatus.ANALYSING,
-                        message=f"Analysed pages {owned_start}-{owned_end}.",
-                        progress=batch_progress,
-                        current_batch=completed_batches,
-                        total_batches=total_batches,
-                    )
-            except Exception:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
+                tasks = [asyncio.create_task(_run_with_limit(batch_spec)) for batch_spec in pending_batches]
+                try:
+                    for completed_task in asyncio.as_completed(tasks):
+                        (
+                            batch_index,
+                            owned_start,
+                            owned_end,
+                            sorted_placements,
+                            full_translation,
+                            batch_log,
+                        ) = await completed_task
+                        job_store.save_batch_checkpoint(
+                            job_id=job_id,
+                            batch_index=batch_index,
+                            owned_start=owned_start,
+                            owned_end=owned_end,
+                            placements=sorted_placements,
+                            full_translation=full_translation,
+                            batch_log=batch_log,
+                        )
+                        placement_groups_by_index[batch_index] = sorted_placements
+                        full_translations_by_index[batch_index] = full_translation
+                        llm_entries_by_index[batch_index] = batch_log
+                        completed_batches += 1
+                        batch_progress = 0.25 + completed_batches / total_batches * 0.60
+                        job_store.set_status(
+                            job_id=job_id,
+                            status=JobStatus.ANALYSING,
+                            message=f"Analysed pages {owned_start}-{owned_end}.",
+                            progress=batch_progress,
+                            current_batch=completed_batches,
+                            total_batches=total_batches,
+                        )
+                except Exception:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    raise
         ordered_batch_indexes = sorted(placement_groups_by_index)
         placement_groups = [placement_groups_by_index[index] for index in ordered_batch_indexes]
         full_translations = [full_translations_by_index.get(index, "") for index in ordered_batch_indexes]
@@ -669,6 +889,7 @@ async def process_job(
             manifest.target_language,
         )
         job_store.persist_output_pdf_artifact(job_id=job_id)
+        job_store.clear_batch_checkpoints(job_id)
         job_store.mark_complete(job_id=job_id, download_filename=download_filename)
     except PDFValidationError as exc:
         LOGGER.warning("Validation failed job_id=%s reason=%s", job_id, exc)
@@ -686,6 +907,13 @@ async def process_job(
             message="Unexpected server error while processing the score.",
         )
     finally:
+        if lock_heartbeat_task is not None:
+            lock_heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await lock_heartbeat_task
+        if processing_lock is not None:
+            with contextlib.suppress(Exception):
+                processing_lock.release()
         elapsed = perf_counter() - started
         LOGGER.info("Finished job job_id=%s duration_s=%.2f", job_id, elapsed)
 

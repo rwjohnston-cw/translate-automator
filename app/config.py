@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     cleanup_interval_seconds: int = 300
     redis_url: str | None = None
     redis_key_prefix: str = "translate-automator"
+    job_stale_after_seconds: int = 45
+    job_resume_cooldown_seconds: int = 8
+    job_processing_lock_ttl_seconds: int = 120
+    job_processing_lock_heartbeat_seconds: int = 20
     app_version: str | None = None
     vercel_git_commit_sha: str | None = None
     vercel_deployment_id: str | None = None

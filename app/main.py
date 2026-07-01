@@ -4,6 +4,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 import contextlib
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 
@@ -263,6 +264,7 @@ def create_app(
     app.state.job_store = store
     app.state.openai_service = service
     app.state.rate_limiter = InMemoryRateLimiter()
+    app.state.last_resume_attempt = {}
 
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next):
@@ -298,6 +300,41 @@ def create_app(
         return await call_next(request)
 
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+    def _start_processing_task(job_id: str, *, reason: str) -> bool:
+        active_task = app.state.active_tasks.get(job_id)
+        if active_task is not None and not active_task.done():
+            return False
+        task = asyncio.create_task(
+            process_job(
+                job_store=app.state.job_store,
+                settings=app.state.settings,
+                openai_service=app.state.openai_service,
+                job_id=job_id,
+            )
+        )
+        app.state.active_tasks[job_id] = task
+
+        def _task_done(_: asyncio.Task, current_job_id: str = job_id) -> None:
+            app.state.active_tasks.pop(current_job_id, None)
+
+        task.add_done_callback(_task_done)
+        LOGGER.info("Started processing task job_id=%s reason=%s", job_id, reason)
+        return True
+
+    def _maybe_resume_stalled_job(manifest) -> None:
+        if manifest.status in {JobStatus.COMPLETE, JobStatus.FAILED}:
+            return
+        now = datetime.now(tz=timezone.utc)
+        seconds_since_update = (now - manifest.updated_at).total_seconds()
+        if seconds_since_update < app.state.settings.job_stale_after_seconds:
+            return
+        cooldown = max(1, app.state.settings.job_resume_cooldown_seconds)
+        last_attempt = app.state.last_resume_attempt.get(manifest.job_id)
+        if last_attempt and (now - last_attempt).total_seconds() < cooldown:
+            return
+        app.state.last_resume_attempt[manifest.job_id] = now
+        _start_processing_task(manifest.job_id, reason="stale_job_resume")
 
     @app.get("/")
     async def index(request: Request):
@@ -417,6 +454,7 @@ def create_app(
             context_pages_override=context_pages_override,
         )
         app.state.job_store.input_pdf_path(manifest.job_id).write_bytes(payload)
+        app.state.job_store.persist_input_pdf_artifact(job_id=manifest.job_id, payload=payload)
         LOGGER.info(
             "Stored upload job_id=%s input_path=%s page_count=%s",
             manifest.job_id,
@@ -430,20 +468,7 @@ def create_app(
             progress=0.0,
         )
 
-        task = asyncio.create_task(
-            process_job(
-                job_store=app.state.job_store,
-                settings=app.state.settings,
-                openai_service=app.state.openai_service,
-                job_id=manifest.job_id,
-            )
-        )
-        app.state.active_tasks[manifest.job_id] = task
-
-        def _task_done(_: asyncio.Task, job_id: str = manifest.job_id) -> None:
-            app.state.active_tasks.pop(job_id, None)
-
-        task.add_done_callback(_task_done)
+        _start_processing_task(manifest.job_id, reason="job_created")
 
         return JSONResponse(
             {
@@ -474,6 +499,8 @@ def create_app(
         manifest = app.state.job_store.get_job(job_id)
         if manifest is None:
             raise HTTPException(status_code=404, detail="Job not found.")
+        _maybe_resume_stalled_job(manifest)
+        manifest = app.state.job_store.get_job(job_id) or manifest
 
         download_url = None
         log_url = None
@@ -492,6 +519,7 @@ def create_app(
                 "download_url": download_url,
                 "log_url": log_url,
                 "error": manifest.error,
+                "updated_at": manifest.updated_at.isoformat(),
             }
         )
 

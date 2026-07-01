@@ -65,6 +65,32 @@ class _FakeOpenAIService:
         return result, log_entry
 
 
+class _CountingOpenAIService(_FakeOpenAIService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.called_batches: list[int] = []
+
+    async def translate_batch(
+        self,
+        *,
+        batch: BatchSpec,
+        target_language: str,
+        image_paths,
+        provider: str,
+        model_name: str | None,
+        position_variant: str,
+    ):
+        self.called_batches.append(batch.index)
+        return await super().translate_batch(
+            batch=batch,
+            target_language=target_language,
+            image_paths=image_paths,
+            provider=provider,
+            model_name=model_name,
+            position_variant=position_variant,
+        )
+
+
 def test_process_job_runs_batches_concurrently_and_keeps_log_order(tmp_path, monkeypatch):
     settings = Settings(
         openai_api_key="sk-test",
@@ -147,3 +173,116 @@ def test_process_job_runs_batches_concurrently_and_keeps_log_order(tmp_path, mon
 
     llm_log_payload = json.loads(job_store.llm_log_json_path(manifest.job_id).read_text(encoding="utf-8"))
     assert [entry["batch_index"] for entry in llm_log_payload["entries"]] == [1, 2, 3]
+
+
+def test_process_job_resumes_from_saved_batch_checkpoints(tmp_path, monkeypatch):
+    settings = Settings(
+        openai_api_key="sk-test",
+        job_root=tmp_path / "jobs",
+        owned_batch_size=1,
+        context_pages=0,
+        max_parallel_batches=1,
+    )
+    job_store = JobStore(settings)
+    manifest = job_store.create_job(
+        original_filename="score.pdf",
+        target_language="English",
+        page_count=2,
+        llm_provider=LLM_PROVIDER_OPENAI,
+        llm_model=None,
+        positioning_variant="standard_3",
+        testing_mode=True,
+    )
+    job_store.input_pdf_path(manifest.job_id).write_bytes(b"%PDF-1.4\nfake")
+
+    def fake_validate_pdf_upload(**kwargs):
+        del kwargs
+        return 2
+
+    def fake_render_pdf_pages_to_images(**kwargs):
+        del kwargs
+        return [tmp_path / "p1.png", tmp_path / "p2.png"]
+
+    def fake_build_batches(*, total_pages: int, owned_batch_size: int, context_pages: int):
+        del total_pages, owned_batch_size, context_pages
+        return [
+            BatchSpec(index=1, owned_start=1, owned_end=1, supplied_start=1, supplied_end=1),
+            BatchSpec(index=2, owned_start=2, owned_end=2, supplied_start=2, supplied_end=2),
+        ]
+
+    def fake_clean_and_filter_batch_placements(*, placements, batch, allowed_positions, logger):
+        del batch, allowed_positions, logger
+        return placements
+
+    def fake_merge_batch_results(
+        *,
+        target_language: str,
+        position_order: dict[str, int],
+        placement_groups,
+        full_translations,
+    ):
+        del position_order
+        merged = [placement for group in placement_groups for placement in group]
+        return TranslationResult(
+            target_language=target_language,
+            full_translation="\n".join(full_translations),
+            placements=merged,
+        )
+
+    def fake_create_translated_pdf(**kwargs):
+        kwargs["output_pdf_path"].write_bytes(b"%PDF-1.4\ntranslated")
+
+    monkeypatch.setattr(jobs_module, "validate_pdf_upload", fake_validate_pdf_upload)
+    monkeypatch.setattr(jobs_module, "render_pdf_pages_to_images", fake_render_pdf_pages_to_images)
+    monkeypatch.setattr(jobs_module, "build_batches", fake_build_batches)
+    monkeypatch.setattr(jobs_module, "clean_and_filter_batch_placements", fake_clean_and_filter_batch_placements)
+    monkeypatch.setattr(jobs_module, "merge_batch_results", fake_merge_batch_results)
+    monkeypatch.setattr(jobs_module, "create_translated_pdf", fake_create_translated_pdf)
+
+    checkpoint_log = jobs_module.BatchLLMLogEntry(
+        batch_index=1,
+        provider=LLM_PROVIDER_OPENAI,
+        model="default",
+        reasoning_effort=None,
+        owned_pages=[1],
+        supplied_pages=[1],
+        pages_sent_count=1,
+        duration_seconds=0.05,
+        input_tokens=10,
+        output_tokens=5,
+        total_tokens=15,
+        input_cost_usd=0.0,
+        output_cost_usd=0.0,
+        total_cost_usd=0.0,
+        pricing_source=None,
+        pricing_notes=None,
+        prompt_sent={"batch": 1},
+        information_received={"provider": LLM_PROVIDER_OPENAI},
+    )
+    job_store.save_batch_checkpoint(
+        job_id=manifest.job_id,
+        batch_index=1,
+        owned_start=1,
+        owned_end=1,
+        placements=[
+            TranslationPlacement(
+                page=1,
+                position="top",
+                translated_text="batch-1",
+            )
+        ],
+        full_translation="full-batch-1",
+        batch_log=checkpoint_log,
+    )
+
+    fake_openai_service = _CountingOpenAIService()
+    asyncio.run(
+        process_job(
+            job_store=job_store,
+            settings=settings,
+            openai_service=fake_openai_service,
+            job_id=manifest.job_id,
+        )
+    )
+
+    assert fake_openai_service.called_batches == [2]

@@ -30,6 +30,10 @@
 
   let timer = null;
   let lastStageIndex = 0;
+  const pollStartedAt = Date.now();
+  const MAX_POLL_MS = 20 * 60 * 1000;
+  const MAX_TRANSIENT_404 = 15;
+  let transient404Count = 0;
 
   function stopPolling() {
     if (timer) {
@@ -122,10 +126,27 @@
   }
 
   async function poll() {
+    if (Date.now() - pollStartedAt > MAX_POLL_MS) {
+      stopPolling();
+      errorArea.textContent =
+        "This job appears stalled. Please refresh the page to trigger recovery.";
+      errorArea.classList.remove("hidden");
+      return;
+    }
     try {
       const response = await fetch(window.jobConfig.statusUrl, {
         headers: { Accept: "application/json" },
       });
+      if (response.status === 404) {
+        transient404Count += 1;
+        if (transient404Count <= MAX_TRANSIENT_404) {
+          errorArea.classList.add("hidden");
+          errorArea.textContent = "";
+          return;
+        }
+      } else {
+        transient404Count = 0;
+      }
       if (!response.ok) {
         throw new Error("Could not load job status.");
       }

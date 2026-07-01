@@ -48,8 +48,12 @@ Defined in `.env.example`:
 - `IMAGE_MAX_DIMENSION`
 - `JOB_TTL_MINUTES`
 - `APP_VERSION` (optional manual override for footer version label)
-- `REDIS_URL` (optional, enables cross-instance job state + artifact cache for serverless deployments)
+- `REDIS_URL` (optional, enables cross-instance job state, checkpoints, and artifact cache for serverless deployments)
 - `REDIS_KEY_PREFIX` (default `translate-automator`)
+- `JOB_STALE_AFTER_SECONDS` (default `45`, stale job detection threshold)
+- `JOB_RESUME_COOLDOWN_SECONDS` (default `8`, minimum delay between auto-resume attempts)
+- `JOB_PROCESSING_LOCK_TTL_SECONDS` (default `120`)
+- `JOB_PROCESSING_LOCK_HEARTBEAT_SECONDS` (default `20`)
 - `TRUST_PROXY_HEADERS` (default `true`, uses `X-Forwarded-For` / `X-Real-IP` for client IP detection)
 - `RATE_LIMIT_ENABLED` (default `true`)
 - `RATE_LIMIT_API_REQUESTS` (default `240`)
