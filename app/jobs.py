@@ -51,6 +51,9 @@ class JobStore:
             if redis is None:
                 raise RuntimeError("redis package is required when REDIS_URL is configured.")
             self.redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=False)
+            LOGGER.info("JobStore configured with Redis key_prefix=%s", self.redis_key_prefix)
+        else:
+            LOGGER.warning("JobStore running without Redis; serverless polling may be inconsistent.")
 
     def _manifest_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "manifest.json"
@@ -207,7 +210,11 @@ class JobStore:
             return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            return JobManifest.model_validate(payload)
+            manifest = JobManifest.model_validate(payload)
+            # Read-through repair: if Redis missed this manifest, republish it so
+            # subsequent requests served by other serverless instances can find it.
+            self._write_manifest_to_redis(manifest)
+            return manifest
         except Exception:
             LOGGER.exception("Failed to read manifest job_id=%s", valid_job_id)
             return None
@@ -486,8 +493,11 @@ async def process_job(
         total_batches = len(batches)
         llm_entries_by_index: dict[int, BatchLLMLogEntry] = {}
         placement_groups_by_index: dict[int, list[TranslationPlacement]] = {}
+        full_translations_by_index: dict[int, str] = {}
 
-        async def _run_single_batch(batch_spec) -> tuple[int, int, int, list[TranslationPlacement], BatchLLMLogEntry]:
+        async def _run_single_batch(
+            batch_spec,
+        ) -> tuple[int, int, int, list[TranslationPlacement], str, BatchLLMLogEntry]:
             LOGGER.info(
                 "Running batch job_id=%s batch=%s owned=%s-%s supplied=%s-%s",
                 job_id,
@@ -522,6 +532,7 @@ async def process_job(
                 batch_spec.owned_start,
                 batch_spec.owned_end,
                 _sort_batch_placements(filtered, position_order),
+                batch_result.full_translation,
                 batch_log,
             )
 
@@ -536,7 +547,9 @@ async def process_job(
             )
             semaphore = asyncio.Semaphore(max_parallel_batches)
             completed_batches = 0
-            tasks: list[asyncio.Task[tuple[int, int, int, list[TranslationPlacement], BatchLLMLogEntry]]] = []
+            tasks: list[
+                asyncio.Task[tuple[int, int, int, list[TranslationPlacement], str, BatchLLMLogEntry]]
+            ] = []
 
             async def _run_with_limit(batch_spec):
                 async with semaphore:
@@ -550,9 +563,11 @@ async def process_job(
                         owned_start,
                         owned_end,
                         sorted_placements,
+                        full_translation,
                         batch_log,
                     ) = await completed_task
                     placement_groups_by_index[batch_index] = sorted_placements
+                    full_translations_by_index[batch_index] = full_translation
                     llm_entries_by_index[batch_index] = batch_log
                     completed_batches += 1
                     batch_progress = 0.25 + completed_batches / total_batches * 0.60
@@ -572,12 +587,14 @@ async def process_job(
                 raise
         ordered_batch_indexes = sorted(placement_groups_by_index)
         placement_groups = [placement_groups_by_index[index] for index in ordered_batch_indexes]
+        full_translations = [full_translations_by_index.get(index, "") for index in ordered_batch_indexes]
         llm_entries = [llm_entries_by_index[index] for index in ordered_batch_indexes]
 
         merged = merge_batch_results(
             target_language=manifest.target_language,
             position_order=position_order,
             placement_groups=placement_groups,
+            full_translations=full_translations,
         )
         job_store.translation_json_path(job_id).write_text(
             merged.model_dump_json(indent=2),

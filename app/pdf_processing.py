@@ -225,7 +225,10 @@ def build_batch_header(batch: BatchSpec, target_language: str, position_variant:
         "space is available or multiple voices sing it at once. "
         "Repeating important text on later pages is acceptable when the score text "
         "continues or returns there. "
-        "Only split when it improves locality for genuinely distinct events."
+        "Only split when it improves locality for genuinely distinct events. "
+        "Before producing placements, reconstruct the full owned-page text and produce "
+        "one complete full_translation value with intended line breaks. "
+        "Then derive placements from that complete translation."
     )
 
 
@@ -271,11 +274,41 @@ def clean_and_filter_batch_placements(
     return filtered
 
 
+def _normalize_line_for_overlap(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _merge_full_translations(full_translations: Iterable[str]) -> str:
+    merged_lines: list[str] = []
+    for chunk in full_translations:
+        normalized_chunk = chunk.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not normalized_chunk:
+            continue
+        candidate_lines = normalized_chunk.split("\n")
+        if not merged_lines:
+            merged_lines.extend(candidate_lines)
+            continue
+
+        max_overlap = min(len(merged_lines), len(candidate_lines), 12)
+        overlap = 0
+        for size in range(max_overlap, 0, -1):
+            if [
+                _normalize_line_for_overlap(line) for line in merged_lines[-size:]
+            ] == [
+                _normalize_line_for_overlap(line) for line in candidate_lines[:size]
+            ]:
+                overlap = size
+                break
+        merged_lines.extend(candidate_lines[overlap:])
+    return "\n".join(merged_lines).strip()
+
+
 def merge_batch_results(
     *,
     target_language: str,
     position_order: dict[str, int],
     placement_groups: Iterable[Sequence[TranslationPlacement]],
+    full_translations: Iterable[str],
 ) -> TranslationResult:
     all_items: list[TranslationPlacement] = []
     for group in placement_groups:
@@ -302,7 +335,11 @@ def merge_batch_results(
             )
         )
 
-    return TranslationResult(target_language=target_language, placements=deduped)
+    return TranslationResult(
+        target_language=target_language,
+        full_translation=_merge_full_translations(full_translations),
+        placements=deduped,
+    )
 
 
 def build_output_filename(original_stem: str, target_language: str) -> str:
@@ -469,6 +506,79 @@ def _insert_html_with_fallback(
     LOGGER.warning("Applied truncated fallback for crowded %s translation box", position)
 
 
+def _insert_full_translation_page(
+    *,
+    doc: fitz.Document,
+    full_translation: str,
+    output_font_size: float,
+    min_font_size: float,
+    archive: fitz.Archive | None,
+) -> bool:
+    normalized = full_translation.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized or doc.page_count < 1:
+        return False
+
+    reference_rect = doc[0].rect
+    page = doc.new_page(pno=0, width=reference_rect.width, height=reference_rect.height)
+    margin = min(page.rect.width, page.rect.height) * 0.06
+    content_rect = fitz.Rect(
+        page.rect.x0 + margin,
+        page.rect.y0 + margin,
+        page.rect.x1 - margin,
+        page.rect.y1 - margin,
+    )
+
+    lines = normalized.split("\n")
+    escaped_body = "<br/>".join(html.escape(line) if line else "&nbsp;" for line in lines)
+    body = (
+        '<div dir="auto" style="'
+        "text-align:left;"
+        "line-height:1.35;"
+        "color:#111111;"
+        f"{FONT_FAMILY_CSS}"
+        '">'
+        "<strong>Complete translation</strong><br/><br/>"
+        f"{escaped_body}</div>"
+    )
+
+    start_size = max(min(18.0, output_font_size + 2.0), min_font_size)
+    size = start_size
+    while size >= min_font_size:
+        result = page.insert_htmlbox(
+            content_rect,
+            body,
+            css=(
+                "html, body { margin: 0; padding: 0; background: #ffffff; } "
+                f"div {{ font-size: {size:.2f}pt; }}"
+            ),
+            archive=archive,
+            scale_low=max(0.55, min_font_size / max(size, 0.1)),
+        )
+        if isinstance(result, tuple):
+            spare_height = result[0] if len(result) > 0 else 0
+            if spare_height >= -1e-6:
+                return True
+        elif isinstance(result, (float, int)):
+            if result >= -1e-6:
+                return True
+        else:
+            return True
+        size -= 0.5
+
+    LOGGER.warning("Inserted full translation page using minimal scale fallback")
+    page.insert_htmlbox(
+        content_rect,
+        body,
+        css=(
+            "html, body { margin: 0; padding: 0; background: #ffffff; } "
+            f"div {{ font-size: {min_font_size:.2f}pt; }}"
+        ),
+        archive=archive,
+        scale_low=0.5,
+    )
+    return True
+
+
 def create_translated_pdf(
     *,
     original_pdf_path: Path,
@@ -498,11 +608,22 @@ def create_translated_pdf(
     archive = _build_font_archive()
     effective_font_size = max(14.0, output_font_size)
     with fitz.open(original_pdf_path) as doc:
+        page_offset = 0
+        if _insert_full_translation_page(
+            doc=doc,
+            full_translation=translation_result.full_translation,
+            output_font_size=effective_font_size,
+            min_font_size=min_font_size,
+            archive=archive,
+        ):
+            page_offset = 1
+
         for page_number, regions in page_map.items():
-            if page_number < 1 or page_number > doc.page_count:
+            mapped_page_number = page_number + page_offset
+            if mapped_page_number < 1 or mapped_page_number > doc.page_count:
                 LOGGER.warning("Skipping placement for non-existent page %s", page_number)
                 continue
-            page = doc.load_page(page_number - 1)
+            page = doc.load_page(mapped_page_number - 1)
             for position in positions_in_order:
                 lines = regions[position]
                 if not lines:

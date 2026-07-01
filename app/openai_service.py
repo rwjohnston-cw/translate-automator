@@ -397,6 +397,16 @@ class OpenAIService:
         try:
             if isinstance(parsed, BaseModel):
                 parsed = parsed.model_dump()
+            if isinstance(parsed, dict) and "full_translation" not in parsed:
+                placements = parsed.get("placements")
+                fallback_lines: list[str] = []
+                if isinstance(placements, list):
+                    for item in placements:
+                        if isinstance(item, dict):
+                            text = str(item.get("translated_text", "")).strip()
+                            if text:
+                                fallback_lines.append(text)
+                parsed["full_translation"] = "\n".join(fallback_lines)
             structured = schema_model.model_validate(parsed)
             return TranslationResult.model_validate(structured.model_dump())
         except Exception as exc:
@@ -454,6 +464,7 @@ class OpenAIService:
             "type": "OBJECT",
             "properties": {
                 "target_language": {"type": "STRING"},
+                "full_translation": {"type": "STRING"},
                 "placements": {
                     "type": "ARRAY",
                     "items": {
@@ -467,7 +478,7 @@ class OpenAIService:
                     },
                 },
             },
-            "required": ["target_language", "placements"],
+            "required": ["target_language", "full_translation", "placements"],
         }
 
     def _to_gemini_parts(self, user_content: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:

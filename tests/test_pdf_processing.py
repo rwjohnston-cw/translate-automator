@@ -74,6 +74,7 @@ def test_pdf_overlay_preserves_page_geometry_and_adds_text(tmp_path: Path, make_
 
     result = TranslationResult(
         target_language="English",
+        full_translation="Lamb of God\nHave mercy\nAmen",
         placements=[
             TranslationPlacement(page=1, position="top", translated_text="Lamb of God"),
             TranslationPlacement(page=1, position="middle", translated_text="Have mercy"),
@@ -92,9 +93,12 @@ def test_pdf_overlay_preserves_page_geometry_and_adds_text(tmp_path: Path, make_
     )
 
     with fitz.open(original_pdf) as source, fitz.open(output_pdf) as translated:
-        assert translated.page_count == source.page_count
-        assert translated[0].rect == source[0].rect
-        text = translated[0].get_text()
+        assert translated.page_count == source.page_count + 1
+        assert translated[1].rect == source[0].rect
+        first_page_text = translated[0].get_text()
+        assert "Complete translation" in first_page_text
+        assert "Lamb of God" in first_page_text
+        text = translated[1].get_text()
         assert "Lamb of God" in text
         assert "Have mercy" in text
         assert "Amen" in text

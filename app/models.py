@@ -114,6 +114,15 @@ def build_dynamic_response_model(allowed_positions: Sequence[str]) -> type[BaseM
     return create_model(
         "DynamicTranslationResult",
         target_language=(str, ...),
+        full_translation=(
+            str,
+            Field(
+                description=(
+                    "Complete translated poem/text for the owned pages, preserving intended line "
+                    "breaks and stanza breaks."
+                )
+            ),
+        ),
         placements=(list[placement_model], ...),
     )
 
@@ -133,7 +142,13 @@ class TranslationPlacement(BaseModel):
 
 class TranslationResult(BaseModel):
     target_language: str
+    full_translation: str = ""
     placements: list[TranslationPlacement]
+
+    @field_validator("full_translation")
+    @classmethod
+    def _normalize_full_translation(cls, value: str) -> str:
+        return value.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 class BatchLLMLogEntry(BaseModel):

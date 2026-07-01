@@ -49,12 +49,23 @@ TEXT RECOGNITION
 - You may use knowledge of a familiar liturgical, poetic, biblical, or operatic text to resolve syllabification or an indistinct letter, but do not add words that are not supported by the score.
 - If a word genuinely cannot be identified, use “[unclear]” rather than inventing it.
 
-TRANSLATION
+TRANSLATION WORKFLOW
+
+- First reconstruct the full sung source text for all supplied pages in reading order.
+- Then produce one complete translation from that reconstructed full text before creating placements.
+- Use that complete translation as the source when splitting text into page placements.
+- Do not translate line-by-line in isolation while scanning the page.
+
+TRANSLATION QUALITY
 
 - Translate the meaning naturally and accurately into the requested target language.
-- Preserve the meaning, grammatical relationships, and tone of the source text.
+- Preserve meaning, grammar, tone, poetic flow, and complete sentence structure.
+- Keep whole sentences or clauses together where possible.
+- Avoid splits that leave a single word on one page/region and the rest on another unless the score layout makes that visually necessary.
 - Do not translate each syllable separately.
-- When a sentence or phrase continues across systems or pages, divide the translation at the point corresponding as closely as possible to the source text visible in each location.
+- When a sentence or phrase continues across systems or pages, split only where it remains natural and readable.
+- In polyphonic writing, avoid repeating the same translated line merely because it appears in multiple simultaneous parts/pages.
+- Print a translated line once unless repetition is genuinely a separate later textual event.
 - Do not include the original-language text unless explicitly requested.
 - Use standard established translations for well-known liturgical phrases where appropriate.
 - Do not add explanations, commentary, transliterations, pronunciation guides, or textual notes.
@@ -88,6 +99,8 @@ STRUCTURED OUTPUT
 Return data matching the supplied structured output schema.
 
 The target_language field must repeat the requested target language.
+
+The full_translation field must contain the complete translated poem/text for the owned pages as continuous readable text, preserving intended line breaks and stanza breaks.
 
 Each placement must contain:
 

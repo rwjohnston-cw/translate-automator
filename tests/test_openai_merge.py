@@ -46,7 +46,9 @@ def test_result_filtering_and_merge_rules():
                 TranslationPlacement(page=2, position="top", translated_text="O Lord"),
             ]
         ],
+        full_translations=["Lord\nHave mercy", "Have mercy\nAmen"],
     )
+    assert merged.full_translation == "Lord\nHave mercy\nAmen"
     assert [(p.page, p.position, p.translated_text) for p in merged.placements] == [
         (2, "top", "Lord"),
         (2, "top", "O Lord"),
@@ -64,6 +66,7 @@ class _FakeResponses:
             output=[],
             output_parsed=TranslationResult(
                 target_language="English",
+                full_translation="Text",
                 placements=[TranslationPlacement(page=2, position="top", translated_text="Text")],
             ),
         )
@@ -199,8 +202,8 @@ def test_gemini_response_schema_is_inline_and_ref_free(tmp_path: Path):
                             "parts": [
                                 {
                                     "text": (
-                                        '{"target_language":"English","placements":'
-                                        '[{"page":1,"position":"top","translated_text":"Text"}]}'
+                                        '{"target_language":"English","full_translation":"Text",'
+                                        '"placements":[{"page":1,"position":"top","translated_text":"Text"}]}'
                                     )
                                 }
                             ]
@@ -229,6 +232,7 @@ def test_gemini_response_schema_is_inline_and_ref_free(tmp_path: Path):
     assert fake_http.last_kwargs is not None
     response_schema = fake_http.last_kwargs["json"]["generationConfig"]["responseSchema"]
     assert response_schema["type"] == "OBJECT"
+    assert response_schema["properties"]["full_translation"]["type"] == "STRING"
     assert response_schema["properties"]["placements"]["items"]["type"] == "OBJECT"
     assert response_schema["properties"]["placements"]["items"]["properties"]["position"]["enum"] == [
         "top",

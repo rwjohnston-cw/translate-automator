@@ -33,6 +33,7 @@ class _FakeOpenAIService:
 
         result = TranslationResult(
             target_language=target_language,
+            full_translation=f"full-batch-{batch.index}",
             placements=[
                 TranslationPlacement(
                     page=batch.owned_start,
@@ -104,10 +105,20 @@ def test_process_job_runs_batches_concurrently_and_keeps_log_order(tmp_path, mon
         del batch, allowed_positions, logger
         return placements
 
-    def fake_merge_batch_results(*, target_language: str, position_order: dict[str, int], placement_groups):
+    def fake_merge_batch_results(
+        *,
+        target_language: str,
+        position_order: dict[str, int],
+        placement_groups,
+        full_translations,
+    ):
         del position_order
         merged = [placement for group in placement_groups for placement in group]
-        return TranslationResult(target_language=target_language, placements=merged)
+        return TranslationResult(
+            target_language=target_language,
+            full_translation="\n".join(full_translations),
+            placements=merged,
+        )
 
     def fake_create_translated_pdf(**kwargs):
         output_pdf_path = kwargs["output_pdf_path"]
