@@ -445,3 +445,7 @@ def test_process_job_canonical_workflow_runs_initial_pass(tmp_path, monkeypatch)
     assert completed_manifest.status == JobStatus.COMPLETE
     assert fake_openai_service.canonical_calls == 1
     assert fake_openai_service.called_batches == [1, 2]
+
+    llm_log_payload = json.loads(job_store.llm_log_json_path(manifest.job_id).read_text(encoding="utf-8"))
+    assert [entry["batch_index"] for entry in llm_log_payload["entries"]] == [0, 1, 2]
+    assert llm_log_payload["totals"]["job_duration_seconds"] > 0

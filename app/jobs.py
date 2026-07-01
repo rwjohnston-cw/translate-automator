@@ -978,7 +978,8 @@ async def process_job(
         ordered_batch_indexes = sorted(placement_groups_by_index)
         placement_groups = [placement_groups_by_index[index] for index in ordered_batch_indexes]
         full_translations = [full_translations_by_index.get(index, "") for index in ordered_batch_indexes]
-        llm_entries = [llm_entries_by_index[index] for index in ordered_batch_indexes]
+        llm_entry_indexes = sorted(llm_entries_by_index)
+        llm_entries = [llm_entries_by_index[index] for index in llm_entry_indexes]
 
         merged = merge_batch_results(
             target_language=manifest.target_language,
@@ -1025,6 +1026,7 @@ async def process_job(
                 "output_tokens": total_output_tokens,
                 "total_tokens": total_tokens,
                 "total_cost_usd": total_cost,
+                "job_duration_seconds": 0.0,
             },
             entries=llm_entries,
         )
@@ -1064,6 +1066,15 @@ async def process_job(
             manifest.target_language,
         )
         job_store.persist_output_pdf_artifact(job_id=job_id)
+
+        # End-to-end runtime from process start until output is ready.
+        llm_log.totals["job_duration_seconds"] = round(perf_counter() - started, 4)
+        job_store.llm_log_json_path(job_id).write_text(
+            llm_log.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        job_store.persist_llm_log_artifact(job_id=job_id)
+
         job_store.clear_batch_checkpoints(job_id)
         job_store.clear_canonical_translation(job_id)
         job_store.mark_complete(job_id=job_id, download_filename=download_filename)
