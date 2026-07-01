@@ -9,6 +9,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
 
+try:
+    import redis
+except ImportError:  # pragma: no cover - optional in local test env
+    redis = None  # type: ignore[assignment]
+
 from app.config import Settings
 from app.models import (
     BatchLLMLogEntry,
@@ -40,6 +45,12 @@ class JobStore:
         self.settings = settings
         self.root = settings.job_root
         self.root.mkdir(parents=True, exist_ok=True)
+        self.redis_client = None
+        self.redis_key_prefix = settings.redis_key_prefix.strip() or "translate-automator"
+        if settings.redis_url:
+            if redis is None:
+                raise RuntimeError("redis package is required when REDIS_URL is configured.")
+            self.redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=False)
 
     def _manifest_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "manifest.json"
@@ -66,6 +77,44 @@ class JobStore:
 
     def llm_log_json_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "llm_log.json"
+
+    def _redis_manifest_key(self, job_id: str) -> str:
+        return f"{self.redis_key_prefix}:job:{job_id}:manifest"
+
+    def _redis_output_key(self, job_id: str) -> str:
+        return f"{self.redis_key_prefix}:job:{job_id}:output_pdf"
+
+    def _redis_log_key(self, job_id: str) -> str:
+        return f"{self.redis_key_prefix}:job:{job_id}:llm_log"
+
+    def _redis_ttl_seconds(self, manifest: JobManifest) -> int:
+        seconds = int((manifest.expires_at - datetime.now(tz=timezone.utc)).total_seconds())
+        return max(1, seconds)
+
+    def _write_manifest_to_redis(self, manifest: JobManifest) -> None:
+        if self.redis_client is None:
+            return
+        try:
+            self.redis_client.set(
+                self._redis_manifest_key(manifest.job_id),
+                manifest.model_dump_json(indent=2).encode("utf-8"),
+                ex=self._redis_ttl_seconds(manifest),
+            )
+        except Exception:
+            LOGGER.exception("Failed to write manifest to redis job_id=%s", manifest.job_id)
+
+    def _read_manifest_from_redis(self, job_id: str) -> JobManifest | None:
+        if self.redis_client is None:
+            return None
+        try:
+            payload_raw = self.redis_client.get(self._redis_manifest_key(job_id))
+            if payload_raw is None:
+                return None
+            payload = json.loads(payload_raw.decode("utf-8"))
+            return JobManifest.model_validate(payload)
+        except Exception:
+            LOGGER.exception("Failed to read manifest from redis job_id=%s", job_id)
+            return None
 
     @staticmethod
     def validate_job_id(raw_job_id: str) -> str:
@@ -143,12 +192,16 @@ class JobStore:
             encoding="utf-8",
         )
         tmp_path.replace(path)
+        self._write_manifest_to_redis(manifest)
 
     def get_job(self, job_id: str) -> JobManifest | None:
         try:
             valid_job_id = self.validate_job_id(job_id)
         except ValueError:
             return None
+        redis_manifest = self._read_manifest_from_redis(valid_job_id)
+        if redis_manifest is not None:
+            return redis_manifest
         path = self._manifest_path(valid_job_id)
         if not path.exists():
             return None
@@ -215,6 +268,7 @@ class JobStore:
             total_batches=None,
             error=None,
             download_filename=download_filename,
+            output_available=True,
         )
         LOGGER.info(
             "Job complete job_id=%s download_filename=%s",
@@ -222,6 +276,9 @@ class JobStore:
             download_filename,
         )
         return manifest
+
+    def mark_log_available(self, *, job_id: str) -> JobManifest:
+        return self.update_job(job_id, log_available=True)
 
     def mark_failed(self, *, job_id: str, message: str) -> JobManifest:
         manifest = self.update_job(
@@ -234,6 +291,62 @@ class JobStore:
         )
         LOGGER.warning("Job failed job_id=%s message=%s", job_id, message)
         return manifest
+
+    def persist_llm_log_artifact(self, *, job_id: str) -> None:
+        if self.redis_client is None:
+            return
+        manifest = self.get_job(job_id)
+        if manifest is None:
+            return
+        log_path = self.llm_log_json_path(job_id)
+        if not log_path.exists():
+            return
+        try:
+            self.redis_client.set(
+                self._redis_log_key(job_id),
+                log_path.read_bytes(),
+                ex=self._redis_ttl_seconds(manifest),
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist llm log artifact to redis job_id=%s", job_id)
+
+    def persist_output_pdf_artifact(self, *, job_id: str) -> None:
+        if self.redis_client is None:
+            return
+        manifest = self.get_job(job_id)
+        if manifest is None:
+            return
+        output_path = self.output_pdf_path(job_id)
+        if not output_path.exists():
+            return
+        try:
+            self.redis_client.set(
+                self._redis_output_key(job_id),
+                output_path.read_bytes(),
+                ex=self._redis_ttl_seconds(manifest),
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist output artifact to redis job_id=%s", job_id)
+
+    def get_cached_output_pdf(self, job_id: str) -> bytes | None:
+        if self.redis_client is None:
+            return None
+        try:
+            payload = self.redis_client.get(self._redis_output_key(job_id))
+            return payload if payload is not None else None
+        except Exception:
+            LOGGER.exception("Failed to read output artifact from redis job_id=%s", job_id)
+            return None
+
+    def get_cached_llm_log(self, job_id: str) -> bytes | None:
+        if self.redis_client is None:
+            return None
+        try:
+            payload = self.redis_client.get(self._redis_log_key(job_id))
+            return payload if payload is not None else None
+        except Exception:
+            LOGGER.exception("Failed to read llm log artifact from redis job_id=%s", job_id)
+            return None
 
     def cleanup_expired(self) -> int:
         now = datetime.now(tz=timezone.utc)
@@ -507,6 +620,8 @@ async def process_job(
             llm_log.model_dump_json(indent=2),
             encoding="utf-8",
         )
+        job_store.mark_log_available(job_id=job_id)
+        job_store.persist_llm_log_artifact(job_id=job_id)
         LOGGER.info(
             "Saved LLM request log job_id=%s path=%s total_cost_usd=%.6f",
             job_id,
@@ -536,6 +651,7 @@ async def process_job(
             manifest.safe_original_stem,
             manifest.target_language,
         )
+        job_store.persist_output_pdf_artifact(job_id=job_id)
         job_store.mark_complete(job_id=job_id, download_filename=download_filename)
     except PDFValidationError as exc:
         LOGGER.warning("Validation failed job_id=%s reason=%s", job_id, exc)

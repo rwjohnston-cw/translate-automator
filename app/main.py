@@ -8,7 +8,7 @@ from pathlib import Path
 import json
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -26,6 +26,7 @@ from app.models import (
 )
 from app.openai_service import OpenAIService
 from app.pdf_processing import PDFValidationError, validate_pdf_upload
+from app.rate_limit import InMemoryRateLimiter, RateLimitRule, resolve_client_ip
 
 logging.basicConfig(
     level=logging.INFO,
@@ -208,6 +209,26 @@ def _resolve_effective_model(settings: Settings, provider: str, model_override: 
     return settings.openai_model
 
 
+def _resolve_rate_limit_rule(request: Request, settings: Settings) -> RateLimitRule | None:
+    method = request.method.upper()
+    path = request.url.path
+
+    if method == "POST" and path == "/api/jobs":
+        limit = settings.rate_limit_create_requests
+        window_seconds = settings.rate_limit_create_window_seconds
+        scope = "create_job"
+    elif path.startswith("/api/"):
+        limit = settings.rate_limit_api_requests
+        window_seconds = settings.rate_limit_api_window_seconds
+        scope = "api"
+    else:
+        return None
+
+    if limit <= 0 or window_seconds <= 0:
+        return None
+    return RateLimitRule(scope=scope, limit=limit, window_seconds=window_seconds)
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -237,6 +258,40 @@ def create_app(
     app.state.settings = cfg
     app.state.job_store = store
     app.state.openai_service = service
+    app.state.rate_limiter = InMemoryRateLimiter()
+
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next):
+        settings = app.state.settings
+        if not settings.rate_limit_enabled:
+            return await call_next(request)
+
+        rule = _resolve_rate_limit_rule(request, settings)
+        if rule is None:
+            return await call_next(request)
+
+        client_ip = resolve_client_ip(request, trust_proxy_headers=settings.trust_proxy_headers)
+        limited, retry_after = app.state.rate_limiter.hit(
+            scope=rule.scope,
+            client_key=client_ip,
+            limit=rule.limit,
+            window_seconds=rule.window_seconds,
+        )
+        if limited:
+            LOGGER.warning(
+                "Rate limit exceeded scope=%s ip=%s method=%s path=%s retry_after_s=%s",
+                rule.scope,
+                client_ip,
+                request.method,
+                request.url.path,
+                retry_after,
+            )
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests. Please wait and try again."},
+                headers={"Retry-After": str(retry_after)},
+            )
+        return await call_next(request)
 
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
@@ -254,6 +309,7 @@ def create_app(
                 "provider_options": PROVIDER_OPTIONS,
                 "position_variant_options": POSITION_VARIANT_OPTIONS,
                 "model_options_json": json.dumps(MODEL_OPTIONS),
+                "app_version": app.state.settings.resolved_app_version,
             },
         )
 
@@ -416,9 +472,9 @@ def create_app(
 
         download_url = None
         log_url = None
-        if manifest.status == JobStatus.COMPLETE and app.state.job_store.output_pdf_path(job_id).exists():
+        if manifest.status == JobStatus.COMPLETE and manifest.output_available:
             download_url = f"/api/jobs/{manifest.job_id}/download"
-        if manifest.status == JobStatus.COMPLETE and app.state.job_store.llm_log_json_path(job_id).exists():
+        if manifest.status == JobStatus.COMPLETE and manifest.log_available:
             log_url = f"/api/jobs/{manifest.job_id}/log"
 
         return JSONResponse(
@@ -441,13 +497,23 @@ def create_app(
         if manifest is None:
             raise HTTPException(status_code=404, detail="Job not found.")
         output_path = app.state.job_store.output_pdf_path(job_id)
-        if manifest.status != JobStatus.COMPLETE or not output_path.exists():
+        if manifest.status != JobStatus.COMPLETE or not manifest.output_available:
+            raise HTTPException(status_code=404, detail="Translated PDF not found.")
+        if output_path.exists():
+            return FileResponse(
+                path=output_path,
+                media_type="application/pdf",
+                filename=manifest.download_filename or "translated_score.pdf",
+            )
+        cached_output = app.state.job_store.get_cached_output_pdf(job_id)
+        if cached_output is None:
             raise HTTPException(status_code=404, detail="Translated PDF not found.")
 
-        return FileResponse(
-            path=output_path,
+        filename = manifest.download_filename or "translated_score.pdf"
+        return Response(
+            content=cached_output,
             media_type="application/pdf",
-            filename=manifest.download_filename or "translated_score.pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
     @app.get("/api/jobs/{job_id}/log")
@@ -457,12 +523,22 @@ def create_app(
         if manifest is None:
             raise HTTPException(status_code=404, detail="Job not found.")
         log_path = app.state.job_store.llm_log_json_path(job_id)
-        if manifest.status != JobStatus.COMPLETE or not log_path.exists():
+        if manifest.status != JobStatus.COMPLETE or not manifest.log_available:
             raise HTTPException(status_code=404, detail="LLM log not found.")
-        return FileResponse(
-            path=log_path,
+        if log_path.exists():
+            return FileResponse(
+                path=log_path,
+                media_type="application/json",
+                filename=f"{manifest.safe_original_stem}_llm_log.json",
+            )
+        cached_log = app.state.job_store.get_cached_llm_log(job_id)
+        if cached_log is None:
+            raise HTTPException(status_code=404, detail="LLM log not found.")
+        filename = f"{manifest.safe_original_stem}_llm_log.json"
+        return Response(
+            content=cached_log,
             media_type="application/json",
-            filename=f"{manifest.safe_original_stem}_llm_log.json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
     return app

@@ -8,13 +8,14 @@ from app.config import Settings
 from app.main import create_app
 
 
-def _build_client(tmp_path: Path) -> TestClient:
+def _build_client(tmp_path: Path, **overrides: object) -> TestClient:
     settings = Settings(
         openai_api_key="sk-test",
         max_upload_mb=1,
         max_pages=100,
         job_root=tmp_path / "jobs",
         cleanup_interval_seconds=3600,
+        **overrides,
     )
     app = create_app(settings=settings)
     return TestClient(app)
@@ -78,4 +79,66 @@ def test_reject_invalid_batching_overrides(tmp_path: Path, make_pdf_bytes):
         )
     assert response.status_code == 400
     assert "Owned batch size" in response.json()["detail"]
+
+
+def test_rate_limit_blocks_repeated_job_creation(tmp_path: Path, make_pdf_bytes):
+    with _build_client(
+        tmp_path,
+        rate_limit_create_requests=2,
+        rate_limit_create_window_seconds=600,
+        rate_limit_api_requests=1000,
+    ) as client:
+        first = client.post(
+            "/api/jobs",
+            data={"target_language": "English"},
+            files={"pdf_file": ("score-1.pdf", make_pdf_bytes(page_count=1), "application/pdf")},
+        )
+        second = client.post(
+            "/api/jobs",
+            data={"target_language": "English"},
+            files={"pdf_file": ("score-2.pdf", make_pdf_bytes(page_count=1), "application/pdf")},
+        )
+        blocked = client.post(
+            "/api/jobs",
+            data={"target_language": "English"},
+            files={"pdf_file": ("score-3.pdf", make_pdf_bytes(page_count=1), "application/pdf")},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert blocked.status_code == 429
+    assert "too many requests" in blocked.json()["detail"].lower()
+    assert int(blocked.headers["Retry-After"]) >= 1
+
+
+def test_rate_limit_uses_forwarded_ip(tmp_path: Path, make_pdf_bytes):
+    with _build_client(
+        tmp_path,
+        rate_limit_create_requests=1,
+        rate_limit_create_window_seconds=600,
+        rate_limit_api_requests=1000,
+        trust_proxy_headers=True,
+    ) as client:
+        first = client.post(
+            "/api/jobs",
+            headers={"x-forwarded-for": "203.0.113.10"},
+            data={"target_language": "English"},
+            files={"pdf_file": ("score-1.pdf", make_pdf_bytes(page_count=1), "application/pdf")},
+        )
+        second_same_ip = client.post(
+            "/api/jobs",
+            headers={"x-forwarded-for": "203.0.113.10"},
+            data={"target_language": "English"},
+            files={"pdf_file": ("score-2.pdf", make_pdf_bytes(page_count=1), "application/pdf")},
+        )
+        third_other_ip = client.post(
+            "/api/jobs",
+            headers={"x-forwarded-for": "203.0.113.11"},
+            data={"target_language": "English"},
+            files={"pdf_file": ("score-3.pdf", make_pdf_bytes(page_count=1), "application/pdf")},
+        )
+
+    assert first.status_code == 200
+    assert second_same_ip.status_code == 429
+    assert third_other_ip.status_code == 200
 

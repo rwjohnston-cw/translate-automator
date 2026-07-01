@@ -18,10 +18,10 @@ class Settings(BaseSettings):
     )
 
     openai_api_key: SecretStr | None = None
-    openai_model: str = "gpt-5.5"
+    openai_model: str = "gpt-5.4-mini"
     openai_reasoning_effort: ReasoningEffort = "medium"
     gemini_api_key: SecretStr | None = None
-    gemini_model: str = "gemini-2.5-flash-lite"
+    gemini_model: str = "gemini-2.5-flash"
     deepseek_api_key: SecretStr | None = None
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_base_url: str = "https://api.deepseek.com"
@@ -39,6 +39,18 @@ class Settings(BaseSettings):
 
     job_root: Path = Path("/tmp/score-translator/jobs")
     cleanup_interval_seconds: int = 300
+    redis_url: str | None = None
+    redis_key_prefix: str = "translate-automator"
+    app_version: str | None = None
+    vercel_git_commit_sha: str | None = None
+    vercel_deployment_id: str | None = None
+    trust_proxy_headers: bool = True
+
+    rate_limit_enabled: bool = True
+    rate_limit_api_requests: int = 240
+    rate_limit_api_window_seconds: int = 60
+    rate_limit_create_requests: int = 5
+    rate_limit_create_window_seconds: int = 600
 
     @computed_field
     @property
@@ -49,4 +61,17 @@ class Settings(BaseSettings):
     @property
     def min_font_size(self) -> float:
         return 7.0
+
+    @property
+    def resolved_app_version(self) -> str:
+        manual = (self.app_version or "").strip()
+        if manual:
+            return manual
+        commit_sha = (self.vercel_git_commit_sha or "").strip()
+        if commit_sha:
+            return commit_sha[:7]
+        deployment_id = (self.vercel_deployment_id or "").strip()
+        if deployment_id:
+            return deployment_id[-8:]
+        return "dev"
 

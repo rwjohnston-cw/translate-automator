@@ -189,6 +189,8 @@ class JobManifest(BaseModel):
     total_batches: int | None = None
     error: str | None = None
     download_filename: str | None = None
+    output_available: bool = False
+    log_available: bool = False
     original_filename: str
     safe_original_stem: str
     target_language: str

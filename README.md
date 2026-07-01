@@ -32,7 +32,7 @@ docker compose logs -f web
 Defined in `.env.example`:
 
 - `OPENAI_API_KEY`
-- `OPENAI_MODEL` (default `gpt-5.5`)
+- `OPENAI_MODEL` (default `gpt-5.4-mini`)
 - `OPENAI_REASONING_EFFORT` (`low|medium|high`)
 - `GEMINI_API_KEY`
 - `GEMINI_MODEL`
@@ -47,8 +47,20 @@ Defined in `.env.example`:
 - `IMAGE_DPI`
 - `IMAGE_MAX_DIMENSION`
 - `JOB_TTL_MINUTES`
+- `APP_VERSION` (optional manual override for footer version label)
+- `REDIS_URL` (optional, enables cross-instance job state + artifact cache for serverless deployments)
+- `REDIS_KEY_PREFIX` (default `translate-automator`)
+- `TRUST_PROXY_HEADERS` (default `true`, uses `X-Forwarded-For` / `X-Real-IP` for client IP detection)
+- `RATE_LIMIT_ENABLED` (default `true`)
+- `RATE_LIMIT_API_REQUESTS` (default `240`)
+- `RATE_LIMIT_API_WINDOW_SECONDS` (default `60`)
+- `RATE_LIMIT_CREATE_REQUESTS` (default `5`)
+- `RATE_LIMIT_CREATE_WINDOW_SECONDS` (default `600`)
 - `OUTPUT_FONT_SIZE`
 - `OUTPUT_BACKGROUND_OPACITY`
+
+If `APP_VERSION` is unset, the app auto-derives a version from Vercel system environment
+variables (`VERCEL_GIT_COMMIT_SHA`, then `VERCEL_DEPLOYMENT_ID`).
 
 ## How Batching Works
 
