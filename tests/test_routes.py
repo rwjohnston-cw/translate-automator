@@ -41,6 +41,7 @@ def test_reject_oversized_pdf(tmp_path: Path):
             files={"pdf_file": ("big.pdf", oversized, "application/pdf")},
         )
     assert response.status_code == 413
+    assert response.json()["detail"] == "The uploaded file is too large. Maximum upload size is 1 MB."
 
 
 def test_reject_missing_language(tmp_path: Path, make_pdf_bytes):

@@ -118,13 +118,17 @@ def _resolve_target_language(target_language: str, custom_target_language: str |
 async def _read_upload_bytes(upload: UploadFile, max_upload_bytes: int) -> bytes:
     total = 0
     chunks: list[bytes] = []
+    max_upload_mb = max_upload_bytes / (1024 * 1024)
     while True:
         chunk = await upload.read(1024 * 1024)
         if not chunk:
             break
         total += len(chunk)
         if total > max_upload_bytes:
-            raise HTTPException(status_code=413, detail="The uploaded file is too large.")
+            raise HTTPException(
+                status_code=413,
+                detail=f"The uploaded file is too large. Maximum upload size is {max_upload_mb:g} MB.",
+            )
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -303,7 +307,8 @@ def create_app(
             context={
                 "request": request,
                 "language_options": LANGUAGE_OPTIONS,
-                "max_upload_mb": app.state.settings.max_upload_mb,
+                "max_upload_mb": app.state.settings.effective_max_upload_mb,
+                "max_upload_mb_display": f"{app.state.settings.effective_max_upload_mb:g}",
                 "default_owned_batch_size": app.state.settings.owned_batch_size,
                 "default_context_pages": app.state.settings.context_pages,
                 "provider_options": PROVIDER_OPTIONS,

@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 ReasoningEffort = Literal["low", "medium", "high"]
+PLATFORM_MAX_UPLOAD_MB = 4.5
 
 
 class Settings(BaseSettings):
@@ -26,7 +27,7 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_base_url: str = "https://api.deepseek.com"
 
-    max_upload_mb: int = 50
+    max_upload_mb: float = PLATFORM_MAX_UPLOAD_MB
     max_pages: int = 100
     owned_batch_size: int = 6
     context_pages: int = 1
@@ -55,7 +56,12 @@ class Settings(BaseSettings):
     @computed_field
     @property
     def max_upload_bytes(self) -> int:
-        return self.max_upload_mb * 1024 * 1024
+        return int(self.effective_max_upload_mb * 1024 * 1024)
+
+    @computed_field
+    @property
+    def effective_max_upload_mb(self) -> float:
+        return min(self.max_upload_mb, PLATFORM_MAX_UPLOAD_MB)
 
     @computed_field
     @property

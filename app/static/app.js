@@ -21,6 +21,10 @@
   const submitBtn = document.getElementById("submit-btn");
   const modelOptionsData = document.getElementById("model-options-data");
   const modelOptions = modelOptionsData ? JSON.parse(modelOptionsData.textContent || "{}") : {};
+  const maxUploadMb = Number.parseFloat(form.dataset.maxUploadMb || "");
+  const maxUploadMbLabel = Number.isFinite(maxUploadMb)
+    ? String(maxUploadMb).replace(/\.0+$/, "")
+    : "4.5";
 
   function showError(message) {
     formError.textContent = message || "";
@@ -156,9 +160,21 @@
         method: "POST",
         body: formData,
       });
-      const payload = await response.json();
+      let payload = null;
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        payload = await response.json();
+      }
       if (!response.ok) {
-        throw new Error(payload.detail || "Upload failed.");
+        if (response.status === 413) {
+          throw new Error(
+            `The uploaded file is too large. Maximum upload size is ${maxUploadMbLabel} MB.`
+          );
+        }
+        throw new Error((payload && payload.detail) || "Upload failed.");
+      }
+      if (!payload || !payload.page_url) {
+        throw new Error("Upload completed but no job page was returned.");
       }
       window.location.assign(payload.page_url);
     } catch (error) {

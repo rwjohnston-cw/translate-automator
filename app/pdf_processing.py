@@ -123,7 +123,10 @@ def validate_pdf_upload(
     if len(payload) == 0:
         raise PDFValidationError("The uploaded file is empty.")
     if len(payload) > max_upload_bytes:
-        raise PDFValidationError("The uploaded file is too large.")
+        max_upload_mb = max_upload_bytes / (1024 * 1024)
+        raise PDFValidationError(
+            f"The uploaded file is too large. Maximum upload size is {max_upload_mb:g} MB."
+        )
     if not payload.startswith(b"%PDF-"):
         raise PDFValidationError("The uploaded file is not a valid PDF.")
 

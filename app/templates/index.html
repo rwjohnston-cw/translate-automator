@@ -18,7 +18,7 @@
         translation.
       </p>
 
-      <form id="upload-form" class="card" novalidate>
+      <form id="upload-form" class="card" novalidate data-max-upload-mb="{{ max_upload_mb_display }}">
         <div
           id="drop-zone"
           class="drop-zone"
@@ -38,7 +38,7 @@
             hidden
           />
           <p id="selected-file" class="selected-file" aria-live="polite">No file selected</p>
-          <p class="small">Maximum upload size: {{ max_upload_mb }} MB</p>
+          <p class="small">Maximum upload size: {{ max_upload_mb_display }} MB</p>
         </div>
 
         <div class="field">
