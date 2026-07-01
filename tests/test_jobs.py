@@ -32,12 +32,20 @@ class _FakeOpenAIService:
         image_paths,
         provider: str,
         model_name: str | None,
+        reasoning_effort: str | None = None,
         position_variant: str,
         system_prompt_override: str | None = None,
         user_header_override: str | None = None,
         extra_user_text_blocks=None,
     ):
-        del image_paths, position_variant, system_prompt_override, user_header_override, extra_user_text_blocks
+        del (
+            image_paths,
+            reasoning_effort,
+            position_variant,
+            system_prompt_override,
+            user_header_override,
+            extra_user_text_blocks,
+        )
         self.active_calls += 1
         self.max_active_calls = max(self.max_active_calls, self.active_calls)
         await asyncio.sleep(0.05)
@@ -58,7 +66,7 @@ class _FakeOpenAIService:
             batch_index=batch.index,
             provider=provider,
             model=model_name or "default",
-            reasoning_effort=None,
+            reasoning_effort=reasoning_effort,
             owned_pages=list(batch.owned_pages),
             supplied_pages=list(batch.supplied_pages),
             pages_sent_count=len(list(batch.supplied_pages)),
@@ -90,6 +98,7 @@ class _CountingOpenAIService(_FakeOpenAIService):
         image_paths,
         provider: str,
         model_name: str | None,
+        reasoning_effort: str | None = None,
         position_variant: str,
         system_prompt_override: str | None = None,
         user_header_override: str | None = None,
@@ -102,6 +111,7 @@ class _CountingOpenAIService(_FakeOpenAIService):
             image_paths=image_paths,
             provider=provider,
             model_name=model_name,
+            reasoning_effort=reasoning_effort,
             position_variant=position_variant,
             system_prompt_override=system_prompt_override,
             user_header_override=user_header_override,
@@ -122,10 +132,11 @@ class _CanonicalOpenAIService(_CountingOpenAIService):
         image_paths,
         provider: str,
         model_name: str | None,
+        reasoning_effort: str | None = None,
         position_variant: str,
         user_header_override: str | None = None,
     ):
-        del image_paths, provider, model_name, position_variant, user_header_override
+        del image_paths, provider, model_name, reasoning_effort, position_variant, user_header_override
         self.canonical_calls += 1
         result = CanonicalTranslationResult(
             target_language=target_language,
@@ -145,7 +156,7 @@ class _CanonicalOpenAIService(_CountingOpenAIService):
             batch_index=batch.index,
             provider=LLM_PROVIDER_OPENAI,
             model="default",
-            reasoning_effort=None,
+            reasoning_effort=reasoning_effort,
             owned_pages=list(batch.owned_pages),
             supplied_pages=list(batch.supplied_pages),
             pages_sent_count=len(list(batch.supplied_pages)),
@@ -179,6 +190,7 @@ def test_process_job_runs_batches_concurrently_and_keeps_log_order(tmp_path, mon
         page_count=3,
         llm_provider=LLM_PROVIDER_OPENAI,
         llm_model=None,
+        llm_reasoning_effort="high",
         translation_workflow=TRANSLATION_WORKFLOW_BATCH,
         positioning_variant="standard_3",
         testing_mode=True,
@@ -248,6 +260,8 @@ def test_process_job_runs_batches_concurrently_and_keeps_log_order(tmp_path, mon
 
     llm_log_payload = json.loads(job_store.llm_log_json_path(manifest.job_id).read_text(encoding="utf-8"))
     assert [entry["batch_index"] for entry in llm_log_payload["entries"]] == [1, 2, 3]
+    assert llm_log_payload["reasoning_effort"] == "high"
+    assert {entry["reasoning_effort"] for entry in llm_log_payload["entries"]} == {"high"}
 
 
 def test_process_job_resumes_from_saved_batch_checkpoints(tmp_path, monkeypatch):
@@ -265,6 +279,7 @@ def test_process_job_resumes_from_saved_batch_checkpoints(tmp_path, monkeypatch)
         page_count=2,
         llm_provider=LLM_PROVIDER_OPENAI,
         llm_model=None,
+        llm_reasoning_effort=None,
         translation_workflow=TRANSLATION_WORKFLOW_BATCH,
         positioning_variant="standard_3",
         testing_mode=True,
@@ -380,6 +395,7 @@ def test_process_job_canonical_workflow_runs_initial_pass(tmp_path, monkeypatch)
         page_count=2,
         llm_provider=LLM_PROVIDER_OPENAI,
         llm_model=None,
+        llm_reasoning_effort=None,
         translation_workflow=TRANSLATION_WORKFLOW_CANONICAL,
         positioning_variant="standard_3",
         testing_mode=True,

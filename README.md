@@ -100,6 +100,7 @@ Enable **Testing mode** on the upload page to expose:
 
 - LLM provider selector (OpenAI, Gemini API, DeepSeek)
 - Model selector/custom model override
+- Reasoning effort selector (provider/model-specific values)
 - Positioning variant selector (3-point, 5-point centered, 6-point split, 20-point grid)
 - Batching overrides for `owned_batch_size` and `context_pages`
 

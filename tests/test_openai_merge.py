@@ -255,3 +255,133 @@ def test_gemini_response_schema_is_inline_and_ref_free(tmp_path: Path):
     assert not _contains_key_deep(response_schema, "$defs")
     assert not _contains_key_deep(response_schema, "$ref")
 
+
+def test_gemini_25_reasoning_effort_uses_thinking_budget(tmp_path: Path):
+    image_path = tmp_path / "page_0001.png"
+    Image.new("RGB", (60, 40), color="white").save(image_path)
+    fake_http = _FakeHTTPClient(
+        _FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": (
+                                        '{"target_language":"English","full_translation":"Text",'
+                                        '"placements":[{"page":1,"position":"top","translated_text":"Text"}]}'
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+    )
+    settings = Settings(gemini_api_key="AQ.test-key")
+    service = OpenAIService(settings=settings, http_client=fake_http)
+    batch = BatchSpec(index=1, owned_start=1, owned_end=1, supplied_start=1, supplied_end=1)
+
+    asyncio.run(
+        service.translate_batch(
+            batch=batch,
+            target_language="English",
+            image_paths=[image_path],
+            provider="gemini",
+            model_name="gemini-2.5-flash",
+            reasoning_effort="high",
+            position_variant=POSITION_VARIANT_STANDARD,
+        )
+    )
+
+    assert fake_http.last_kwargs is not None
+    thinking_config = fake_http.last_kwargs["json"]["generationConfig"]["thinkingConfig"]
+    assert thinking_config["thinkingBudget"] == 16384
+
+
+def test_gemini_3_reasoning_effort_uses_thinking_level(tmp_path: Path):
+    image_path = tmp_path / "page_0001.png"
+    Image.new("RGB", (60, 40), color="white").save(image_path)
+    fake_http = _FakeHTTPClient(
+        _FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": (
+                                        '{"target_language":"English","full_translation":"Text",'
+                                        '"placements":[{"page":1,"position":"top","translated_text":"Text"}]}'
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+    )
+    settings = Settings(gemini_api_key="AQ.test-key")
+    service = OpenAIService(settings=settings, http_client=fake_http)
+    batch = BatchSpec(index=1, owned_start=1, owned_end=1, supplied_start=1, supplied_end=1)
+
+    asyncio.run(
+        service.translate_batch(
+            batch=batch,
+            target_language="English",
+            image_paths=[image_path],
+            provider="gemini",
+            model_name="gemini-3-flash-preview",
+            reasoning_effort="low",
+            position_variant=POSITION_VARIANT_STANDARD,
+        )
+    )
+
+    assert fake_http.last_kwargs is not None
+    thinking_config = fake_http.last_kwargs["json"]["generationConfig"]["thinkingConfig"]
+    assert thinking_config["thinkingLevel"] == "low"
+
+
+def test_deepseek_reasoning_effort_uses_reasoning_effort_field(tmp_path: Path):
+    image_path = tmp_path / "page_0001.png"
+    Image.new("RGB", (60, 40), color="white").save(image_path)
+    fake_http = _FakeHTTPClient(
+        _FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"target_language":"English","full_translation":"Text",'
+                                '"placements":[{"page":1,"position":"top","translated_text":"Text"}]}'
+                            )
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
+    )
+    settings = Settings(deepseek_api_key="dsk-test")
+    service = OpenAIService(settings=settings, http_client=fake_http)
+    batch = BatchSpec(index=1, owned_start=1, owned_end=1, supplied_start=1, supplied_end=1)
+
+    asyncio.run(
+        service.translate_batch(
+            batch=batch,
+            target_language="English",
+            image_paths=[image_path],
+            provider="deepseek",
+            model_name="deepseek-v4-flash",
+            reasoning_effort="max",
+            position_variant=POSITION_VARIANT_STANDARD,
+        )
+    )
+
+    assert fake_http.last_kwargs is not None
+    assert fake_http.last_kwargs["json"]["reasoning_effort"] == "max"

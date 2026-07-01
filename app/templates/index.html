@@ -94,6 +94,12 @@
           </div>
 
           <div class="field">
+            <label for="llm-reasoning-effort">Reasoning effort</label>
+            <select id="llm-reasoning-effort" name="llm_reasoning_effort"></select>
+            <p id="llm-reasoning-help" class="small"></p>
+          </div>
+
+          <div class="field">
             <label for="positioning-variant">Page positioning variant</label>
             <select id="positioning-variant" name="positioning_variant">
               {% for option in position_variant_options %}
@@ -147,6 +153,8 @@
     </main>
     <p class="app-version">version {{ app_version }}</p>
     <script id="model-options-data" type="application/json">{{ model_options_json | safe }}</script>
+    <script id="reasoning-options-data" type="application/json">{{ reasoning_options_json | safe }}</script>
+    <script id="reasoning-api-field-data" type="application/json">{{ reasoning_api_field_json | safe }}</script>
     <script src="/static/app.js" defer></script>
   </body>
 </html>

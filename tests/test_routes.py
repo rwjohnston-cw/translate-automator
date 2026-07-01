@@ -97,6 +97,42 @@ def test_reject_invalid_workflow_mode(tmp_path: Path, make_pdf_bytes):
     assert "workflow" in response.json()["detail"].lower()
 
 
+def test_reject_invalid_reasoning_effort_for_model(tmp_path: Path, make_pdf_bytes):
+    with _build_client(tmp_path) as client:
+        response = client.post(
+            "/api/jobs",
+            data={
+                "target_language": "English",
+                "testing_mode": "on",
+                "llm_provider": "openai",
+                "llm_model": "gpt-5-mini",
+                "llm_reasoning_effort": "none",
+            },
+            files={"pdf_file": ("score.pdf", make_pdf_bytes(page_count=1), "application/pdf")},
+        )
+    assert response.status_code == 400
+    assert "reasoning effort" in response.json()["detail"].lower()
+
+
+def test_accept_valid_reasoning_effort_for_model(tmp_path: Path, make_pdf_bytes):
+    with _build_client(tmp_path) as client:
+        response = client.post(
+            "/api/jobs",
+            data={
+                "target_language": "English",
+                "testing_mode": "on",
+                "llm_provider": "openai",
+                "llm_model": "gpt-5-mini",
+                "llm_reasoning_effort": "minimal",
+            },
+            files={"pdf_file": ("score.pdf", make_pdf_bytes(page_count=1), "application/pdf")},
+        )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_id"]
+    assert payload["page_url"].startswith("/jobs/")
+
+
 def test_rate_limit_blocks_repeated_job_creation(tmp_path: Path, make_pdf_bytes):
     with _build_client(
         tmp_path,

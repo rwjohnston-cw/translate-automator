@@ -30,6 +30,12 @@ from app.prompts import (
 
 LOGGER = logging.getLogger(__name__)
 
+GEMINI_BUDGET_BY_EFFORT = {
+    "low": 1024,
+    "medium": 8192,
+    "high": 16384,
+}
+
 
 class OpenAIServiceError(RuntimeError):
     """Base OpenAI processing error."""
@@ -107,6 +113,7 @@ class OpenAIService:
         image_paths: Sequence[Any],
         provider: str,
         model_name: str | None,
+        reasoning_effort: str | None = None,
         position_variant: str,
         system_prompt_override: str | None = None,
         user_header_override: str | None = None,
@@ -125,6 +132,7 @@ class OpenAIService:
                     image_paths=image_paths,
                     provider=provider,
                     model_name=model_name,
+                    reasoning_effort=reasoning_effort,
                     position_variant=position_variant,
                     system_prompt_override=system_prompt_override,
                     user_header_override=user_header_override,
@@ -140,6 +148,7 @@ class OpenAIService:
         image_paths: Sequence[Any],
         provider: str,
         model_name: str | None,
+        reasoning_effort: str | None = None,
         position_variant: str,
         system_prompt_override: str | None = None,
         user_header_override: str | None = None,
@@ -158,11 +167,16 @@ class OpenAIService:
         system_prompt = system_prompt_override or build_system_prompt(position_variant)
         prompt_sent = self._build_prompt_log(system_prompt=system_prompt, user_content=user_content)
         model = self._resolve_model(provider=provider, model_name=model_name)
+        effective_reasoning_effort = self._resolve_reasoning_effort(
+            provider=provider,
+            requested_reasoning_effort=reasoning_effort,
+        )
         started = perf_counter()
         try:
             result, usage_info, information_received = await self._translate_structured(
                 provider=provider,
                 model=model,
+                reasoning_effort=effective_reasoning_effort,
                 system_prompt=system_prompt,
                 user_content=user_content,
                 schema_model=schema_model,
@@ -197,9 +211,7 @@ class OpenAIService:
             batch_index=batch.index,
             provider=provider,
             model=model,
-            reasoning_effort=(
-                self.settings.openai_reasoning_effort if provider == LLM_PROVIDER_OPENAI else None
-            ),
+            reasoning_effort=effective_reasoning_effort,
             owned_pages=list(batch.owned_pages),
             supplied_pages=list(batch.supplied_pages),
             pages_sent_count=len(list(batch.supplied_pages)),
@@ -225,6 +237,7 @@ class OpenAIService:
         image_paths: Sequence[Any],
         provider: str,
         model_name: str | None,
+        reasoning_effort: str | None = None,
         position_variant: str,
         user_header_override: str | None = None,
     ) -> tuple[CanonicalTranslationResult, BatchLLMLogEntry]:
@@ -241,6 +254,7 @@ class OpenAIService:
                     image_paths=image_paths,
                     provider=provider,
                     model_name=model_name,
+                    reasoning_effort=reasoning_effort,
                     position_variant=position_variant,
                     user_header_override=user_header_override,
                 )
@@ -254,6 +268,7 @@ class OpenAIService:
         image_paths: Sequence[Any],
         provider: str,
         model_name: str | None,
+        reasoning_effort: str | None = None,
         position_variant: str,
         user_header_override: str | None = None,
     ) -> tuple[CanonicalTranslationResult, BatchLLMLogEntry]:
@@ -267,11 +282,16 @@ class OpenAIService:
         system_prompt = build_canonical_translation_prompt(position_variant)
         prompt_sent = self._build_prompt_log(system_prompt=system_prompt, user_content=user_content)
         model = self._resolve_model(provider=provider, model_name=model_name)
+        effective_reasoning_effort = self._resolve_reasoning_effort(
+            provider=provider,
+            requested_reasoning_effort=reasoning_effort,
+        )
         started = perf_counter()
         try:
             result, usage_info, information_received = await self._translate_structured(
                 provider=provider,
                 model=model,
+                reasoning_effort=effective_reasoning_effort,
                 system_prompt=system_prompt,
                 user_content=user_content,
                 schema_model=CanonicalTranslationResult,
@@ -304,9 +324,7 @@ class OpenAIService:
             batch_index=batch.index,
             provider=provider,
             model=model,
-            reasoning_effort=(
-                self.settings.openai_reasoning_effort if provider == LLM_PROVIDER_OPENAI else None
-            ),
+            reasoning_effort=effective_reasoning_effort,
             owned_pages=list(batch.owned_pages),
             supplied_pages=list(batch.supplied_pages),
             pages_sent_count=len(list(batch.supplied_pages)),
@@ -329,6 +347,7 @@ class OpenAIService:
         *,
         provider: str,
         model: str,
+        reasoning_effort: str | None,
         system_prompt: str,
         user_content: list[dict[str, Any]],
         schema_model: type[Any],
@@ -338,6 +357,7 @@ class OpenAIService:
         if provider == LLM_PROVIDER_OPENAI:
             return await self._translate_structured_openai(
                 model=model,
+                reasoning_effort=reasoning_effort,
                 system_prompt=system_prompt,
                 user_content=user_content,
                 schema_model=schema_model,
@@ -350,6 +370,7 @@ class OpenAIService:
             )
             return await self._translate_structured_gemini(
                 model=model,
+                reasoning_effort=reasoning_effort,
                 system_prompt=system_prompt,
                 user_content=user_content,
                 schema_model=schema_model,
@@ -359,6 +380,7 @@ class OpenAIService:
         if provider == LLM_PROVIDER_DEEPSEEK:
             return await self._translate_structured_deepseek(
                 model=model,
+                reasoning_effort=reasoning_effort,
                 system_prompt=system_prompt,
                 user_content=user_content,
                 schema_model=schema_model,
@@ -370,22 +392,25 @@ class OpenAIService:
         self,
         *,
         model: str,
+        reasoning_effort: str | None,
         system_prompt: str,
         user_content: list[dict[str, Any]],
         schema_model: type[Any],
         payload_kind: str,
     ) -> tuple[Any, dict[str, int | None], dict[str, Any]]:
         client = self._require_client()
+        request_payload: dict[str, Any] = {
+            "model": model,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "text_format": schema_model,
+        }
+        if reasoning_effort:
+            request_payload["reasoning"] = {"effort": reasoning_effort}
         try:
-            response = await client.responses.parse(
-                model=model,
-                input=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                text_format=schema_model,
-                reasoning={"effort": self.settings.openai_reasoning_effort},
-            )
+            response = await client.responses.parse(**request_payload)
         except (APITimeoutError, APIConnectionError, RateLimitError) as exc:
             raise TransientOpenAIError("OpenAI request timed out or was rate-limited.") from exc
         except APIStatusError as exc:
@@ -417,6 +442,7 @@ class OpenAIService:
         self,
         *,
         model: str,
+        reasoning_effort: str | None,
         system_prompt: str,
         user_content: list[dict[str, Any]],
         schema_model: type[Any],
@@ -439,6 +465,12 @@ class OpenAIService:
                 "responseSchema": gemini_schema,
             },
         }
+        thinking_config = self._gemini_thinking_config(
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        if thinking_config is not None:
+            payload["generationConfig"]["thinkingConfig"] = thinking_config
         try:
             response = await self.http_client.post(
                 endpoint,
@@ -491,6 +523,7 @@ class OpenAIService:
         self,
         *,
         model: str,
+        reasoning_effort: str | None,
         system_prompt: str,
         user_content: list[dict[str, Any]],
         schema_model: type[Any],
@@ -511,6 +544,8 @@ class OpenAIService:
             ],
             "response_format": {"type": "json_object"},
         }
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
         try:
             response = await self.http_client.post(
                 endpoint,
@@ -734,6 +769,40 @@ class OpenAIService:
         if provider == LLM_PROVIDER_DEEPSEEK:
             return self.settings.deepseek_model
         return self.settings.openai_model
+
+    def _gemini_thinking_config(
+        self,
+        *,
+        model: str,
+        reasoning_effort: str | None,
+    ) -> dict[str, Any] | None:
+        if not reasoning_effort:
+            return None
+        normalized = reasoning_effort.strip().lower()
+        if not normalized:
+            return None
+        # Gemini 2.5 models use token budget control instead of semantic levels.
+        if model.startswith("gemini-2.5-"):
+            budget = GEMINI_BUDGET_BY_EFFORT.get(normalized)
+            if budget is None:
+                raise PermanentOpenAIError(
+                    f"Unsupported Gemini 2.5 reasoning effort '{normalized}'."
+                )
+            return {"thinkingBudget": budget}
+        return {"thinkingLevel": normalized}
+
+    def _resolve_reasoning_effort(
+        self,
+        *,
+        provider: str,
+        requested_reasoning_effort: str | None,
+    ) -> str | None:
+        if requested_reasoning_effort is not None:
+            cleaned = requested_reasoning_effort.strip()
+            return cleaned or None
+        if provider == LLM_PROVIDER_OPENAI:
+            return self.settings.openai_reasoning_effort
+        return None
 
     @staticmethod
     def _build_prompt_log(*, system_prompt: str, user_content: Sequence[dict[str, Any]]) -> dict[str, Any]:

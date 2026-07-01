@@ -247,6 +247,7 @@ class JobManifest(BaseModel):
     target_language: str
     llm_provider: LLMProvider = LLM_PROVIDER_OPENAI
     llm_model: str | None = None
+    llm_reasoning_effort: str | None = None
     translation_workflow: TranslationWorkflow = TRANSLATION_WORKFLOW_BATCH
     positioning_variant: PositionVariant = POSITION_VARIANT_STANDARD
     testing_mode: bool = False

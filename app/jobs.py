@@ -162,6 +162,7 @@ class JobStore:
         page_count: int,
         llm_provider: str,
         llm_model: str | None,
+        llm_reasoning_effort: str | None,
         translation_workflow: str,
         positioning_variant: str,
         testing_mode: bool,
@@ -179,6 +180,7 @@ class JobStore:
             target_language=target_language,
             llm_provider=llm_provider,
             llm_model=llm_model,
+            llm_reasoning_effort=llm_reasoning_effort,
             translation_workflow=translation_workflow,
             positioning_variant=positioning_variant,
             testing_mode=testing_mode,
@@ -191,7 +193,8 @@ class JobStore:
         LOGGER.info(
             (
                 "Created job job_id=%s filename=%s target_language=%s page_count=%s "
-                "testing_mode=%s provider=%s selected_model=%s workflow=%s positioning_variant=%s "
+                "testing_mode=%s provider=%s selected_model=%s selected_reasoning_effort=%s "
+                "workflow=%s positioning_variant=%s "
                 "selected_owned_batch_size=%s selected_context_pages=%s "
                 "effective_owned_batch_size=%s effective_context_pages=%s expires_at=%s"
             ),
@@ -202,6 +205,7 @@ class JobStore:
             manifest.testing_mode,
             manifest.llm_provider,
             manifest.llm_model or "default",
+            manifest.llm_reasoning_effort or "provider_default",
             manifest.translation_workflow,
             manifest.positioning_variant,
             manifest.owned_batch_size_override if manifest.owned_batch_size_override is not None else "default",
@@ -699,7 +703,8 @@ async def process_job(
     LOGGER.info(
         (
             "Starting job job_id=%s page_count=%s target_language=%s testing_mode=%s "
-            "provider=%s selected_model=%s workflow=%s position_variant=%s "
+            "provider=%s selected_model=%s selected_reasoning_effort=%s "
+            "workflow=%s position_variant=%s "
             "selected_batch_size=%s selected_context_pages=%s "
             "effective_batch_size=%s effective_context_pages=%s "
             "render_dpi=%s image_max_dimension=%s max_parallel_batches=%s"
@@ -710,6 +715,7 @@ async def process_job(
         manifest.testing_mode,
         manifest.llm_provider,
         manifest.llm_model or "default",
+        manifest.llm_reasoning_effort or "provider_default",
         manifest.translation_workflow,
         manifest.positioning_variant,
         manifest.owned_batch_size_override if manifest.owned_batch_size_override is not None else "default",
@@ -820,6 +826,7 @@ async def process_job(
                     image_paths=rendered_paths,
                     provider=manifest.llm_provider,
                     model_name=manifest.llm_model,
+                    reasoning_effort=manifest.llm_reasoning_effort,
                     position_variant=manifest.positioning_variant,
                     user_header_override=(
                         f"target_language: {manifest.target_language}\n"
@@ -878,6 +885,7 @@ async def process_job(
                 image_paths=rendered_paths,
                 provider=manifest.llm_provider,
                 model_name=manifest.llm_model,
+                reasoning_effort=manifest.llm_reasoning_effort,
                 position_variant=manifest.positioning_variant,
                 system_prompt_override=(
                     build_placement_from_canonical_prompt(manifest.positioning_variant)
@@ -1015,9 +1023,7 @@ async def process_job(
                 if manifest.llm_provider == "gemini"
                 else settings.deepseek_model
             ),
-            reasoning_effort=(
-                settings.openai_reasoning_effort if manifest.llm_provider == "openai" else None
-            ),
+            reasoning_effort=manifest.llm_reasoning_effort,
             source_pdf_page_count=page_count,
             total_batches=len(llm_entries),
             total_pages_sent=sum(entry.pages_sent_count for entry in llm_entries),

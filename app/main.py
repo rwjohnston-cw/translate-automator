@@ -102,6 +102,43 @@ MODEL_OPTIONS = {
     ],
 }
 
+REASONING_OPTIONS = {
+    LLM_PROVIDER_OPENAI: {
+        "__default__": ["none", "minimal", "low", "medium", "high", "xhigh"],
+        # Source: OpenAI model pages (Jul 2026)
+        "gpt-5.5": ["none", "low", "medium", "high", "xhigh"],
+        "gpt-5.4": ["none", "low", "medium", "high", "xhigh"],
+        "gpt-5.4-mini": ["none", "low", "medium", "high", "xhigh"],
+        "gpt-5.4-nano": ["none", "low", "medium", "high", "xhigh"],
+        # Older GPT-5 mini/nano generations may not support "none"/"xhigh";
+        # keep these constrained to their documented legacy levels.
+        "gpt-5-mini": ["minimal", "low", "medium", "high"],
+        "gpt-5-nano": ["minimal", "low", "medium", "high"],
+    },
+    LLM_PROVIDER_GEMINI: {
+        "__default__": ["low", "medium", "high"],
+        # Source: Gemini thinking guide + Gemma-on-Gemini docs (Jul 2026)
+        "gemini-2.5-flash-lite": ["low", "medium", "high"],
+        "gemini-2.5-flash": ["low", "medium", "high"],
+        "gemini-2.5-pro": ["low", "medium", "high"],
+        "gemini-3-flash-preview": ["low", "medium", "high"],
+        "gemini-3.1-flash-lite": ["low", "medium", "high"],
+        "gemma-4-31b-it": ["high"],
+    },
+    LLM_PROVIDER_DEEPSEEK: {
+        "__default__": ["high", "max"],
+        # Source: DeepSeek Chat Completions docs (Jul 2026)
+        "deepseek-v4-flash": ["high", "max"],
+        "deepseek-v4-pro": ["high", "max"],
+    },
+}
+
+REASONING_API_FIELD_BY_PROVIDER = {
+    LLM_PROVIDER_OPENAI: "reasoning.effort",
+    LLM_PROVIDER_GEMINI: "generationConfig.thinkingConfig.thinkingLevel",
+    LLM_PROVIDER_DEEPSEEK: "reasoning_effort",
+}
+
 WORKFLOW_MODE_OPTIONS = [
     {
         "value": TRANSLATION_WORKFLOW_BATCH,
@@ -235,6 +272,49 @@ def _resolve_effective_model(settings: Settings, provider: str, model_override: 
     if provider == LLM_PROVIDER_DEEPSEEK:
         return settings.deepseek_model
     return settings.openai_model
+
+
+def _resolve_supported_reasoning_efforts(provider: str, model_name: str | None) -> tuple[str, ...]:
+    provider_map = REASONING_OPTIONS.get(provider, {})
+    cleaned_model = (model_name or "").strip()
+    if cleaned_model:
+        model_specific = provider_map.get(cleaned_model)
+        if model_specific:
+            return tuple(model_specific)
+    default_values = provider_map.get("__default__", [])
+    return tuple(default_values)
+
+
+def _resolve_effective_reasoning_effort(
+    *,
+    settings: Settings,
+    provider: str,
+    model_name: str,
+    selected_reasoning_effort: str | None,
+) -> str | None:
+    cleaned_selected = (selected_reasoning_effort or "").strip() or None
+    if cleaned_selected is None:
+        if provider == LLM_PROVIDER_OPENAI:
+            return settings.openai_reasoning_effort
+        return None
+
+    allowed = _resolve_supported_reasoning_efforts(provider, model_name)
+    if allowed and cleaned_selected not in allowed:
+        allowed_label = ", ".join(allowed)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid reasoning effort '{cleaned_selected}' for {provider}:{model_name}. "
+                f"Allowed values: {allowed_label}."
+            ),
+        )
+    return cleaned_selected
+
+
+def _resolve_reasoning_api_field(provider: str, model_name: str) -> str:
+    if provider == LLM_PROVIDER_GEMINI and model_name.startswith("gemini-2.5-"):
+        return "generationConfig.thinkingConfig.thinkingBudget"
+    return REASONING_API_FIELD_BY_PROVIDER.get(provider, "n/a")
 
 
 def _resolve_rate_limit_rule(request: Request, settings: Settings) -> RateLimitRule | None:
@@ -375,6 +455,8 @@ def create_app(
                 "position_variant_options": POSITION_VARIANT_OPTIONS,
                 "workflow_mode_options": WORKFLOW_MODE_OPTIONS,
                 "model_options_json": json.dumps(MODEL_OPTIONS),
+                "reasoning_options_json": json.dumps(REASONING_OPTIONS),
+                "reasoning_api_field_json": json.dumps(REASONING_API_FIELD_BY_PROVIDER),
                 "app_version": app.state.settings.resolved_app_version,
             },
         )
@@ -387,6 +469,7 @@ def create_app(
         testing_mode: str | None = Form(None),
         llm_provider: str | None = Form(None),
         llm_model: str | None = Form(None),
+        llm_reasoning_effort: str | None = Form(None),
         positioning_variant: str | None = Form(None),
         translation_workflow: str | None = Form(None),
         owned_batch_size: str | None = Form(None),
@@ -394,6 +477,7 @@ def create_app(
     ):
         raw_selected_provider = (llm_provider or "").strip().lower() or None
         raw_selected_model = (llm_model or "").strip() or None
+        raw_selected_reasoning_effort = (llm_reasoning_effort or "").strip() or None
         raw_selected_variant = (positioning_variant or "").strip() or None
         raw_selected_workflow = (translation_workflow or "").strip() or None
         raw_selected_owned_batch_size = (owned_batch_size or "").strip() or None
@@ -442,13 +526,23 @@ def create_app(
             else app.state.settings.context_pages
         )
         effective_model = _resolve_effective_model(app.state.settings, provider, model_override)
+        effective_reasoning_effort = _resolve_effective_reasoning_effort(
+            settings=app.state.settings,
+            provider=provider,
+            model_name=effective_model,
+            selected_reasoning_effort=llm_reasoning_effort if resolved_testing_mode else None,
+        )
+        reasoning_api_field = _resolve_reasoning_api_field(provider, effective_model)
         LOGGER.info(
             (
                 "Received upload filename=%s bytes=%s target_language=%s "
                 "selected_testing_mode=%s selected_provider=%s selected_model=%s "
+                "selected_reasoning_effort=%s "
                 "selected_position_variant=%s selected_workflow=%s "
                 "selected_owned_batch_size=%s selected_context_pages=%s "
-                "effective_provider=%s effective_model=%s effective_position_variant=%s effective_workflow=%s "
+                "effective_provider=%s effective_model=%s effective_reasoning_effort=%s "
+                "reasoning_effort_field=%s "
+                "effective_position_variant=%s effective_workflow=%s "
                 "effective_owned_batch_size=%s effective_context_pages=%s"
             ),
             pdf_file.filename,
@@ -457,12 +551,15 @@ def create_app(
             resolved_testing_mode,
             raw_selected_provider or "default",
             raw_selected_model or "default",
+            raw_selected_reasoning_effort or "provider_default",
             raw_selected_variant or "default",
             raw_selected_workflow or "default",
             raw_selected_owned_batch_size or "default",
             raw_selected_context_pages or "default",
             provider,
             effective_model,
+            effective_reasoning_effort or "provider_default",
+            reasoning_api_field,
             position_variant,
             resolved_workflow_mode,
             effective_owned_batch_size,
@@ -484,6 +581,7 @@ def create_app(
             page_count=page_count,
             llm_provider=provider,
             llm_model=model_override,
+            llm_reasoning_effort=effective_reasoning_effort,
             translation_workflow=resolved_workflow_mode,
             positioning_variant=position_variant,
             testing_mode=resolved_testing_mode,

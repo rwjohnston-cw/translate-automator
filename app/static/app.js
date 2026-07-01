@@ -14,6 +14,8 @@
   const providerSelect = document.getElementById("llm-provider");
   const modelSelect = document.getElementById("llm-model-select");
   const modelCustom = document.getElementById("llm-model-custom");
+  const reasoningSelect = document.getElementById("llm-reasoning-effort");
+  const reasoningHelp = document.getElementById("llm-reasoning-help");
   const positioningVariantSelect = document.getElementById("positioning-variant");
   const translationWorkflowSelect = document.getElementById("translation-workflow");
   const ownedBatchSizeInput = document.getElementById("owned-batch-size");
@@ -21,7 +23,15 @@
   const formError = document.getElementById("form-error");
   const submitBtn = document.getElementById("submit-btn");
   const modelOptionsData = document.getElementById("model-options-data");
+  const reasoningOptionsData = document.getElementById("reasoning-options-data");
+  const reasoningApiFieldData = document.getElementById("reasoning-api-field-data");
   const modelOptions = modelOptionsData ? JSON.parse(modelOptionsData.textContent || "{}") : {};
+  const reasoningOptions = reasoningOptionsData
+    ? JSON.parse(reasoningOptionsData.textContent || "{}")
+    : {};
+  const reasoningApiField = reasoningApiFieldData
+    ? JSON.parse(reasoningApiFieldData.textContent || "{}")
+    : {};
   const maxUploadMb = Number.parseFloat(form.dataset.maxUploadMb || "");
   const maxUploadMbLabel = Number.isFinite(maxUploadMb)
     ? String(maxUploadMb).replace(/\.0+$/, "")
@@ -49,6 +59,7 @@
     providerSelect.disabled = !isTesting;
     modelSelect.disabled = !isTesting;
     modelCustom.disabled = !isTesting;
+    reasoningSelect.disabled = !isTesting;
     positioningVariantSelect.disabled = !isTesting;
     if (translationWorkflowSelect) {
       translationWorkflowSelect.disabled = !isTesting;
@@ -79,6 +90,49 @@
       modelSelect.value = "";
       modelCustom.value = "";
     }
+    updateReasoningOptions();
+  }
+
+  function updateReasoningOptions() {
+    const provider = providerSelect.value;
+    const model = (modelCustom.value || modelSelect.value || "").trim();
+    const providerOptions = reasoningOptions[provider] || {};
+    const options = providerOptions[model] || providerOptions.__default__ || [];
+    const previousValue = reasoningSelect.value;
+
+    reasoningSelect.innerHTML = "";
+    const defaultOption = document.createElement("option");
+    defaultOption.value = "";
+    defaultOption.textContent = "Use provider default";
+    reasoningSelect.appendChild(defaultOption);
+
+    options.forEach(function (effort) {
+      const option = document.createElement("option");
+      option.value = effort;
+      option.textContent = effort;
+      reasoningSelect.appendChild(option);
+    });
+
+    if (options.includes(previousValue)) {
+      reasoningSelect.value = previousValue;
+    } else {
+      reasoningSelect.value = "";
+    }
+
+    let apiField = reasoningApiField[provider];
+    if (provider === "gemini" && model.startsWith("gemini-2.5-")) {
+      apiField = "generationConfig.thinkingConfig.thinkingBudget";
+    }
+    if (reasoningHelp) {
+      if (apiField && options.length) {
+        reasoningHelp.textContent =
+          "Sent as " + apiField + ". Supported values for this model: " + options.join(", ") + ".";
+      } else if (apiField) {
+        reasoningHelp.textContent = "Sent as " + apiField + ".";
+      } else {
+        reasoningHelp.textContent = "";
+      }
+    }
   }
 
   function assignDroppedFile(fileList) {
@@ -105,7 +159,9 @@
     } else {
       modelCustom.value = "";
     }
+    updateReasoningOptions();
   });
+  modelCustom.addEventListener("input", updateReasoningOptions);
 
   dropZone.addEventListener("dragover", function (event) {
     event.preventDefault();
@@ -152,6 +208,7 @@
       formData.append("testing_mode", "on");
       formData.append("llm_provider", providerSelect.value);
       formData.append("llm_model", modelCustom.value.trim());
+      formData.append("llm_reasoning_effort", reasoningSelect.value);
       formData.append("positioning_variant", positioningVariantSelect.value);
       if (translationWorkflowSelect) {
         formData.append("translation_workflow", translationWorkflowSelect.value);
@@ -194,6 +251,7 @@
   updateFileLabel();
   updateCustomLanguageVisibility();
   updateModelOptions();
+  updateReasoningOptions();
   updateTestingVisibility();
 })();
 
