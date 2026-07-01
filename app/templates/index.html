@@ -103,6 +103,16 @@
           </div>
 
           <div class="field">
+            <label for="translation-workflow">Translation workflow</label>
+            <select id="translation-workflow" name="translation_workflow">
+              {% for option in workflow_mode_options %}
+              <option value="{{ option.value }}">{{ option.label }}</option>
+              {% endfor %}
+            </select>
+            <p class="small">Single-pass is faster. Two-pass improves cross-batch consistency.</p>
+          </div>
+
+          <div class="field">
             <label for="owned-batch-size">Owned batch size</label>
             <input
               id="owned-batch-size"

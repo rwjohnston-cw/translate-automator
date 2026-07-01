@@ -18,6 +18,10 @@ LLM_PROVIDER_GEMINI = "gemini"
 LLM_PROVIDER_DEEPSEEK = "deepseek"
 LLMProvider = Literal["openai", "gemini", "deepseek"]
 
+TRANSLATION_WORKFLOW_BATCH = "batch_translate_and_place"
+TRANSLATION_WORKFLOW_CANONICAL = "canonical_then_place"
+TranslationWorkflow = Literal["batch_translate_and_place", "canonical_then_place"]
+
 POSITION_VARIANT_MAP: dict[str, tuple[str, ...]] = {
     POSITION_VARIANT_STANDARD: ("top", "middle", "bottom"),
     POSITION_VARIANT_CENTERED_5: (
@@ -151,6 +155,38 @@ class TranslationResult(BaseModel):
         return value.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
+class CanonicalTranslationLine(BaseModel):
+    source_text: str = Field(
+        description="One original-language sung line or phrase from the reconstructed source text."
+    )
+    translated_text: str = Field(
+        description="The corresponding target-language translation of that line or phrase."
+    )
+
+    @field_validator("source_text", "translated_text")
+    @classmethod
+    def _strip_line(cls, value: str) -> str:
+        return value.strip()
+
+
+class CanonicalTranslationResult(BaseModel):
+    target_language: str
+    full_translation: str = Field(
+        description="Complete target-language translation with intended poetic line breaks."
+    )
+    aligned_lines: list[CanonicalTranslationLine] = Field(
+        description=(
+            "Line-by-line alignment between reconstructed source text and translation. "
+            "Use reading order and keep alignment semantic, not syllabic."
+        )
+    )
+
+    @field_validator("full_translation")
+    @classmethod
+    def _normalize_full_translation(cls, value: str) -> str:
+        return value.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 class BatchLLMLogEntry(BaseModel):
     batch_index: int
     provider: str
@@ -211,6 +247,7 @@ class JobManifest(BaseModel):
     target_language: str
     llm_provider: LLMProvider = LLM_PROVIDER_OPENAI
     llm_model: str | None = None
+    translation_workflow: TranslationWorkflow = TRANSLATION_WORKFLOW_BATCH
     positioning_variant: PositionVariant = POSITION_VARIANT_STANDARD
     testing_mode: bool = False
     owned_batch_size_override: int | None = None

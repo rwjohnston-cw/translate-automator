@@ -23,6 +23,8 @@ from app.models import (
     POSITION_VARIANT_GRID_20,
     POSITION_VARIANT_SPLIT_6,
     POSITION_VARIANT_STANDARD,
+    TRANSLATION_WORKFLOW_BATCH,
+    TRANSLATION_WORKFLOW_CANONICAL,
     JobStatus,
 )
 from app.openai_service import OpenAIService
@@ -99,6 +101,17 @@ MODEL_OPTIONS = {
         "deepseek-v4-pro",
     ],
 }
+
+WORKFLOW_MODE_OPTIONS = [
+    {
+        "value": TRANSLATION_WORKFLOW_BATCH,
+        "label": "Single-pass batch translate + place",
+    },
+    {
+        "value": TRANSLATION_WORKFLOW_CANONICAL,
+        "label": "Two-pass: canonical translation, then placement",
+    },
+]
 
 
 def _resolve_target_language(target_language: str, custom_target_language: str | None) -> str:
@@ -181,9 +194,16 @@ def _resolve_testing_options(
     llm_provider: str | None,
     llm_model: str | None,
     positioning_variant: str | None,
-) -> tuple[str, str | None, str, bool]:
+    translation_workflow: str | None,
+) -> tuple[str, str | None, str, str, bool]:
     if not testing_mode:
-        return (LLM_PROVIDER_OPENAI, None, POSITION_VARIANT_STANDARD, False)
+        return (
+            LLM_PROVIDER_OPENAI,
+            None,
+            POSITION_VARIANT_STANDARD,
+            TRANSLATION_WORKFLOW_BATCH,
+            False,
+        )
 
     provider = (llm_provider or LLM_PROVIDER_OPENAI).strip().lower()
     if provider not in {LLM_PROVIDER_OPENAI, LLM_PROVIDER_GEMINI, LLM_PROVIDER_DEEPSEEK}:
@@ -199,7 +219,10 @@ def _resolve_testing_options(
         raise HTTPException(status_code=400, detail="Invalid page positioning variant.")
 
     model = (llm_model or "").strip() or None
-    return (provider, model, variant, True)
+    workflow = (translation_workflow or TRANSLATION_WORKFLOW_BATCH).strip()
+    if workflow not in {TRANSLATION_WORKFLOW_BATCH, TRANSLATION_WORKFLOW_CANONICAL}:
+        raise HTTPException(status_code=400, detail="Invalid translation workflow mode.")
+    return (provider, model, variant, workflow, True)
 
 
 def _resolve_effective_model(settings: Settings, provider: str, model_override: str | None) -> str:
@@ -350,6 +373,7 @@ def create_app(
                 "default_context_pages": app.state.settings.context_pages,
                 "provider_options": PROVIDER_OPTIONS,
                 "position_variant_options": POSITION_VARIANT_OPTIONS,
+                "workflow_mode_options": WORKFLOW_MODE_OPTIONS,
                 "model_options_json": json.dumps(MODEL_OPTIONS),
                 "app_version": app.state.settings.resolved_app_version,
             },
@@ -364,21 +388,30 @@ def create_app(
         llm_provider: str | None = Form(None),
         llm_model: str | None = Form(None),
         positioning_variant: str | None = Form(None),
+        translation_workflow: str | None = Form(None),
         owned_batch_size: str | None = Form(None),
         context_pages: str | None = Form(None),
     ):
         raw_selected_provider = (llm_provider or "").strip().lower() or None
         raw_selected_model = (llm_model or "").strip() or None
         raw_selected_variant = (positioning_variant or "").strip() or None
+        raw_selected_workflow = (translation_workflow or "").strip() or None
         raw_selected_owned_batch_size = (owned_batch_size or "").strip() or None
         raw_selected_context_pages = (context_pages or "").strip() or None
 
         resolved_language = _resolve_target_language(target_language or "", custom_target_language)
-        provider, model_override, position_variant, resolved_testing_mode = _resolve_testing_options(
+        (
+            provider,
+            model_override,
+            position_variant,
+            resolved_workflow_mode,
+            resolved_testing_mode,
+        ) = _resolve_testing_options(
             testing_mode=_to_bool(testing_mode),
             llm_provider=llm_provider,
             llm_model=llm_model,
             positioning_variant=positioning_variant,
+            translation_workflow=translation_workflow,
         )
         owned_batch_size_override = None
         context_pages_override = None
@@ -413,8 +446,9 @@ def create_app(
             (
                 "Received upload filename=%s bytes=%s target_language=%s "
                 "selected_testing_mode=%s selected_provider=%s selected_model=%s "
-                "selected_position_variant=%s selected_owned_batch_size=%s selected_context_pages=%s "
-                "effective_provider=%s effective_model=%s effective_position_variant=%s "
+                "selected_position_variant=%s selected_workflow=%s "
+                "selected_owned_batch_size=%s selected_context_pages=%s "
+                "effective_provider=%s effective_model=%s effective_position_variant=%s effective_workflow=%s "
                 "effective_owned_batch_size=%s effective_context_pages=%s"
             ),
             pdf_file.filename,
@@ -424,11 +458,13 @@ def create_app(
             raw_selected_provider or "default",
             raw_selected_model or "default",
             raw_selected_variant or "default",
+            raw_selected_workflow or "default",
             raw_selected_owned_batch_size or "default",
             raw_selected_context_pages or "default",
             provider,
             effective_model,
             position_variant,
+            resolved_workflow_mode,
             effective_owned_batch_size,
             effective_context_pages,
         )
@@ -448,6 +484,7 @@ def create_app(
             page_count=page_count,
             llm_provider=provider,
             llm_model=model_override,
+            translation_workflow=resolved_workflow_mode,
             positioning_variant=position_variant,
             testing_mode=resolved_testing_mode,
             owned_batch_size_override=owned_batch_size_override,

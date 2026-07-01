@@ -14,6 +14,7 @@ from app.pricing import estimate_cost_usd
 from app.config import Settings
 from app.models import (
     BatchLLMLogEntry,
+    CanonicalTranslationResult,
     LLM_PROVIDER_DEEPSEEK,
     LLM_PROVIDER_GEMINI,
     LLM_PROVIDER_OPENAI,
@@ -22,7 +23,10 @@ from app.models import (
     positions_for_variant,
 )
 from app.pdf_processing import BatchSpec, build_batch_header, build_image_data_url
-from app.prompts import build_system_prompt
+from app.prompts import (
+    build_canonical_translation_prompt,
+    build_system_prompt,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -68,13 +72,21 @@ class OpenAIService:
         target_language: str,
         image_paths: Sequence[Any],
         position_variant: str,
+        header_override: str | None = None,
+        extra_text_blocks: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
+        header_text = header_override or build_batch_header(batch, target_language, position_variant)
         content: list[dict[str, Any]] = [
             {
                 "type": "input_text",
-                "text": build_batch_header(batch, target_language, position_variant),
+                "text": header_text,
             }
         ]
+        for text in extra_text_blocks or ():
+            cleaned = text.strip()
+            if not cleaned:
+                continue
+            content.append({"type": "input_text", "text": cleaned})
         for page_number in batch.supplied_pages:
             image_path = image_paths[page_number - 1]
             content.append({"type": "input_text", "text": f"PDF_PAGE_NUMBER: {page_number}"})
@@ -96,6 +108,9 @@ class OpenAIService:
         provider: str,
         model_name: str | None,
         position_variant: str,
+        system_prompt_override: str | None = None,
+        user_header_override: str | None = None,
+        extra_user_text_blocks: Sequence[str] | None = None,
     ) -> tuple[TranslationResult, BatchLLMLogEntry]:
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(3),
@@ -111,6 +126,9 @@ class OpenAIService:
                     provider=provider,
                     model_name=model_name,
                     position_variant=position_variant,
+                    system_prompt_override=system_prompt_override,
+                    user_header_override=user_header_override,
+                    extra_user_text_blocks=extra_user_text_blocks,
                 )
         raise RuntimeError("Retry loop terminated unexpectedly.")
 
@@ -123,6 +141,9 @@ class OpenAIService:
         provider: str,
         model_name: str | None,
         position_variant: str,
+        system_prompt_override: str | None = None,
+        user_header_override: str | None = None,
+        extra_user_text_blocks: Sequence[str] | None = None,
     ) -> tuple[TranslationResult, BatchLLMLogEntry]:
         allowed_positions = positions_for_variant(position_variant)
         schema_model = build_dynamic_response_model(allowed_positions)
@@ -131,36 +152,23 @@ class OpenAIService:
             target_language=target_language,
             image_paths=image_paths,
             position_variant=position_variant,
+            header_override=user_header_override,
+            extra_text_blocks=extra_user_text_blocks,
         )
-        system_prompt = build_system_prompt(position_variant)
+        system_prompt = system_prompt_override or build_system_prompt(position_variant)
         prompt_sent = self._build_prompt_log(system_prompt=system_prompt, user_content=user_content)
         model = self._resolve_model(provider=provider, model_name=model_name)
         started = perf_counter()
         try:
-            if provider == LLM_PROVIDER_OPENAI:
-                result, usage_info, information_received = await self._translate_batch_openai(
-                    model=model,
-                    system_prompt=system_prompt,
-                    user_content=user_content,
-                    schema_model=schema_model,
-                )
-            elif provider == LLM_PROVIDER_GEMINI:
-                result, usage_info, information_received = await self._translate_batch_gemini(
-                    model=model,
-                    system_prompt=system_prompt,
-                    user_content=user_content,
-                    schema_model=schema_model,
-                    allowed_positions=allowed_positions,
-                )
-            elif provider == LLM_PROVIDER_DEEPSEEK:
-                result, usage_info, information_received = await self._translate_batch_deepseek(
-                    model=model,
-                    system_prompt=system_prompt,
-                    user_content=user_content,
-                    schema_model=schema_model,
-                )
-            else:
-                raise PermanentOpenAIError("Unsupported provider.")
+            result, usage_info, information_received = await self._translate_structured(
+                provider=provider,
+                model=model,
+                system_prompt=system_prompt,
+                user_content=user_content,
+                schema_model=schema_model,
+                payload_kind="translation",
+                allowed_positions=allowed_positions,
+            )
         except Exception as exc:
             if isinstance(exc, OpenAIServiceError):
                 raise
@@ -209,14 +217,164 @@ class OpenAIService:
         )
         return result, entry
 
-    async def _translate_batch_openai(
+    async def translate_canonical(
+        self,
+        *,
+        batch: BatchSpec,
+        target_language: str,
+        image_paths: Sequence[Any],
+        provider: str,
+        model_name: str | None,
+        position_variant: str,
+        user_header_override: str | None = None,
+    ) -> tuple[CanonicalTranslationResult, BatchLLMLogEntry]:
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=8),
+            retry=retry_if_exception_type(TransientOpenAIError),
+            reraise=True,
+        ):
+            with attempt:
+                return await self._translate_canonical_once(
+                    batch=batch,
+                    target_language=target_language,
+                    image_paths=image_paths,
+                    provider=provider,
+                    model_name=model_name,
+                    position_variant=position_variant,
+                    user_header_override=user_header_override,
+                )
+        raise RuntimeError("Retry loop terminated unexpectedly.")
+
+    async def _translate_canonical_once(
+        self,
+        *,
+        batch: BatchSpec,
+        target_language: str,
+        image_paths: Sequence[Any],
+        provider: str,
+        model_name: str | None,
+        position_variant: str,
+        user_header_override: str | None = None,
+    ) -> tuple[CanonicalTranslationResult, BatchLLMLogEntry]:
+        user_content = self.build_user_content(
+            batch=batch,
+            target_language=target_language,
+            image_paths=image_paths,
+            position_variant=position_variant,
+            header_override=user_header_override,
+        )
+        system_prompt = build_canonical_translation_prompt(position_variant)
+        prompt_sent = self._build_prompt_log(system_prompt=system_prompt, user_content=user_content)
+        model = self._resolve_model(provider=provider, model_name=model_name)
+        started = perf_counter()
+        try:
+            result, usage_info, information_received = await self._translate_structured(
+                provider=provider,
+                model=model,
+                system_prompt=system_prompt,
+                user_content=user_content,
+                schema_model=CanonicalTranslationResult,
+                payload_kind="canonical",
+                allowed_positions=None,
+            )
+        except Exception as exc:
+            if isinstance(exc, OpenAIServiceError):
+                raise
+            raise TransientOpenAIError("Unexpected provider communication error.") from exc
+        finally:
+            elapsed = perf_counter() - started
+            LOGGER.info(
+                "Provider canonical call completed provider=%s model=%s pages=%s-%s duration_s=%.2f",
+                provider,
+                model,
+                batch.owned_start,
+                batch.owned_end,
+                elapsed,
+            )
+        input_tokens = usage_info.get("input_tokens")
+        output_tokens = usage_info.get("output_tokens")
+        costs = estimate_cost_usd(
+            provider=provider,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        entry = BatchLLMLogEntry(
+            batch_index=batch.index,
+            provider=provider,
+            model=model,
+            reasoning_effort=(
+                self.settings.openai_reasoning_effort if provider == LLM_PROVIDER_OPENAI else None
+            ),
+            owned_pages=list(batch.owned_pages),
+            supplied_pages=list(batch.supplied_pages),
+            pages_sent_count=len(list(batch.supplied_pages)),
+            duration_seconds=round(elapsed, 4),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=usage_info.get("total_tokens"),
+            input_cost_usd=costs["input_cost_usd"],
+            output_cost_usd=costs["output_cost_usd"],
+            total_cost_usd=costs["total_cost_usd"],
+            pricing_source=costs["pricing_source"],
+            pricing_notes=costs["pricing_notes"],
+            prompt_sent=prompt_sent,
+            information_received=information_received,
+        )
+        return result, entry
+
+    async def _translate_structured(
+        self,
+        *,
+        provider: str,
+        model: str,
+        system_prompt: str,
+        user_content: list[dict[str, Any]],
+        schema_model: type[Any],
+        payload_kind: str,
+        allowed_positions: Sequence[str] | None,
+    ) -> tuple[Any, dict[str, int | None], dict[str, Any]]:
+        if provider == LLM_PROVIDER_OPENAI:
+            return await self._translate_structured_openai(
+                model=model,
+                system_prompt=system_prompt,
+                user_content=user_content,
+                schema_model=schema_model,
+                payload_kind=payload_kind,
+            )
+        if provider == LLM_PROVIDER_GEMINI:
+            gemini_schema = self._resolve_gemini_schema(
+                payload_kind=payload_kind,
+                allowed_positions=allowed_positions,
+            )
+            return await self._translate_structured_gemini(
+                model=model,
+                system_prompt=system_prompt,
+                user_content=user_content,
+                schema_model=schema_model,
+                gemini_schema=gemini_schema,
+                payload_kind=payload_kind,
+            )
+        if provider == LLM_PROVIDER_DEEPSEEK:
+            return await self._translate_structured_deepseek(
+                model=model,
+                system_prompt=system_prompt,
+                user_content=user_content,
+                schema_model=schema_model,
+                payload_kind=payload_kind,
+            )
+        raise PermanentOpenAIError("Unsupported provider.")
+
+    async def _translate_structured_openai(
         self,
         *,
         model: str,
         system_prompt: str,
         user_content: list[dict[str, Any]],
         schema_model: type[Any],
-    ) -> tuple[TranslationResult, dict[str, int | None], dict[str, Any]]:
+        payload_kind: str,
+    ) -> tuple[Any, dict[str, int | None], dict[str, Any]]:
         client = self._require_client()
         try:
             response = await client.responses.parse(
@@ -242,24 +400,29 @@ class OpenAIService:
         parsed = getattr(response, "output_parsed", None)
         if parsed is None:
             raise TransientOpenAIError("OpenAI returned an empty response.")
-        translation = self._validate_translation_payload(parsed, schema_model)
+        structured_payload = self._validate_structured_payload(
+            parsed,
+            schema_model=schema_model,
+            payload_kind=payload_kind,
+        )
         usage = self._extract_openai_usage(response)
         info_received = {
             "response_id": getattr(response, "id", None),
             "output_types": [getattr(entry, "type", None) for entry in output_entries],
-            "structured_output": translation.model_dump(),
+            "structured_output": structured_payload.model_dump(),
         }
-        return translation, usage, info_received
+        return structured_payload, usage, info_received
 
-    async def _translate_batch_gemini(
+    async def _translate_structured_gemini(
         self,
         *,
         model: str,
         system_prompt: str,
         user_content: list[dict[str, Any]],
         schema_model: type[Any],
-        allowed_positions: Sequence[str],
-    ) -> tuple[TranslationResult, dict[str, int | None], dict[str, Any]]:
+        gemini_schema: dict[str, Any],
+        payload_kind: str,
+    ) -> tuple[Any, dict[str, int | None], dict[str, Any]]:
         api_key = self._normalize_api_key(
             self.settings.gemini_api_key.get_secret_value() if self.settings.gemini_api_key else None
         )
@@ -273,7 +436,7 @@ class OpenAIService:
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "responseSchema": self._build_gemini_response_schema(allowed_positions),
+                "responseSchema": gemini_schema,
             },
         }
         try:
@@ -311,23 +474,28 @@ class OpenAIService:
             parsed_json = json.loads(text)
         except json.JSONDecodeError as exc:
             raise TransientOpenAIError("Gemini returned invalid JSON.") from exc
-        translation = self._validate_translation_payload(parsed_json, schema_model)
+        structured_payload = self._validate_structured_payload(
+            parsed_json,
+            schema_model=schema_model,
+            payload_kind=payload_kind,
+        )
         usage = self._extract_gemini_usage(payload_json)
         info_received = {
             "candidate_count": len(candidates),
             "raw_text": text,
-            "structured_output": translation.model_dump(),
+            "structured_output": structured_payload.model_dump(),
         }
-        return translation, usage, info_received
+        return structured_payload, usage, info_received
 
-    async def _translate_batch_deepseek(
+    async def _translate_structured_deepseek(
         self,
         *,
         model: str,
         system_prompt: str,
         user_content: list[dict[str, Any]],
         schema_model: type[Any],
-    ) -> tuple[TranslationResult, dict[str, int | None], dict[str, Any]]:
+        payload_kind: str,
+    ) -> tuple[Any, dict[str, int | None], dict[str, Any]]:
         api_key = self._normalize_api_key(
             self.settings.deepseek_api_key.get_secret_value() if self.settings.deepseek_api_key else None
         )
@@ -380,24 +548,33 @@ class OpenAIService:
             parsed_json = json.loads(content)
         except json.JSONDecodeError as exc:
             raise TransientOpenAIError("DeepSeek returned invalid JSON.") from exc
-        translation = self._validate_translation_payload(parsed_json, schema_model)
+        structured_payload = self._validate_structured_payload(
+            parsed_json,
+            schema_model=schema_model,
+            payload_kind=payload_kind,
+        )
         usage = self._extract_deepseek_usage(payload_json)
         info_received = {
             "choice_count": len(choices),
             "raw_text": content,
-            "structured_output": translation.model_dump(),
+            "structured_output": structured_payload.model_dump(),
         }
-        return translation, usage, info_received
+        return structured_payload, usage, info_received
 
-    def _validate_translation_payload(
+    def _validate_structured_payload(
         self,
         parsed: Any,
         schema_model: type[Any],
-    ) -> TranslationResult:
+        payload_kind: str,
+    ) -> Any:
         try:
             if isinstance(parsed, BaseModel):
                 parsed = parsed.model_dump()
-            if isinstance(parsed, dict) and "full_translation" not in parsed:
+            if (
+                payload_kind == "translation"
+                and isinstance(parsed, dict)
+                and "full_translation" not in parsed
+            ):
                 placements = parsed.get("placements")
                 fallback_lines: list[str] = []
                 if isinstance(placements, list):
@@ -407,8 +584,7 @@ class OpenAIService:
                             if text:
                                 fallback_lines.append(text)
                 parsed["full_translation"] = "\n".join(fallback_lines)
-            structured = schema_model.model_validate(parsed)
-            return TranslationResult.model_validate(structured.model_dump())
+            return schema_model.model_validate(parsed)
         except Exception as exc:
             raise TransientOpenAIError("Provider returned invalid structured output.") from exc
 
@@ -457,6 +633,20 @@ class OpenAIService:
         return message[:500]
 
     @staticmethod
+    def _resolve_gemini_schema(
+        *,
+        payload_kind: str,
+        allowed_positions: Sequence[str] | None,
+    ) -> dict[str, Any]:
+        if payload_kind == "translation":
+            if allowed_positions is None:
+                raise PermanentOpenAIError("Missing allowed positions for translation schema.")
+            return OpenAIService._build_gemini_response_schema(allowed_positions)
+        if payload_kind == "canonical":
+            return OpenAIService._build_gemini_canonical_response_schema()
+        raise PermanentOpenAIError("Unsupported Gemini payload schema.")
+
+    @staticmethod
     def _build_gemini_response_schema(allowed_positions: Sequence[str]) -> dict[str, Any]:
         # Gemini's responseSchema parser rejects JSON Schema refs/defs.
         # Build an inline schema that uses only supported primitive fields.
@@ -479,6 +669,28 @@ class OpenAIService:
                 },
             },
             "required": ["target_language", "full_translation", "placements"],
+        }
+
+    @staticmethod
+    def _build_gemini_canonical_response_schema() -> dict[str, Any]:
+        return {
+            "type": "OBJECT",
+            "properties": {
+                "target_language": {"type": "STRING"},
+                "full_translation": {"type": "STRING"},
+                "aligned_lines": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "source_text": {"type": "STRING"},
+                            "translated_text": {"type": "STRING"},
+                        },
+                        "required": ["source_text", "translated_text"],
+                    },
+                },
+            },
+            "required": ["target_language", "full_translation", "aligned_lines"],
         }
 
     def _to_gemini_parts(self, user_content: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:

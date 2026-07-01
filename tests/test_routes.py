@@ -82,6 +82,21 @@ def test_reject_invalid_batching_overrides(tmp_path: Path, make_pdf_bytes):
     assert "Owned batch size" in response.json()["detail"]
 
 
+def test_reject_invalid_workflow_mode(tmp_path: Path, make_pdf_bytes):
+    with _build_client(tmp_path) as client:
+        response = client.post(
+            "/api/jobs",
+            data={
+                "target_language": "English",
+                "testing_mode": "on",
+                "translation_workflow": "bad-mode",
+            },
+            files={"pdf_file": ("score.pdf", make_pdf_bytes(page_count=1), "application/pdf")},
+        )
+    assert response.status_code == 400
+    assert "workflow" in response.json()["detail"].lower()
+
+
 def test_rate_limit_blocks_repeated_job_creation(tmp_path: Path, make_pdf_bytes):
     with _build_client(
         tmp_path,

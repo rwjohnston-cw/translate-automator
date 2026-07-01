@@ -15,6 +15,7 @@
   const modelSelect = document.getElementById("llm-model-select");
   const modelCustom = document.getElementById("llm-model-custom");
   const positioningVariantSelect = document.getElementById("positioning-variant");
+  const translationWorkflowSelect = document.getElementById("translation-workflow");
   const ownedBatchSizeInput = document.getElementById("owned-batch-size");
   const contextPagesInput = document.getElementById("context-pages");
   const formError = document.getElementById("form-error");
@@ -49,6 +50,9 @@
     modelSelect.disabled = !isTesting;
     modelCustom.disabled = !isTesting;
     positioningVariantSelect.disabled = !isTesting;
+    if (translationWorkflowSelect) {
+      translationWorkflowSelect.disabled = !isTesting;
+    }
     ownedBatchSizeInput.disabled = !isTesting;
     contextPagesInput.disabled = !isTesting;
   }
@@ -149,6 +153,9 @@
       formData.append("llm_provider", providerSelect.value);
       formData.append("llm_model", modelCustom.value.trim());
       formData.append("positioning_variant", positioningVariantSelect.value);
+      if (translationWorkflowSelect) {
+        formData.append("translation_workflow", translationWorkflowSelect.value);
+      }
       formData.append("owned_batch_size", ownedBatchSizeInput.value.trim());
       formData.append("context_pages", contextPagesInput.value.trim());
     }

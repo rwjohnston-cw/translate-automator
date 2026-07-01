@@ -281,6 +281,38 @@ def _normalize_line_for_overlap(value: str) -> str:
     return " ".join(value.split())
 
 
+def _tokenize_for_overlap(value: str) -> list[str]:
+    normalized = re.sub(r"[^\w\s]+", " ", value.lower())
+    return [token for token in normalized.split() if token]
+
+
+def _find_token_overlap(
+    previous_lines: Sequence[str],
+    candidate_lines: Sequence[str],
+    *,
+    max_tokens: int = 90,
+    min_tokens: int = 5,
+) -> int:
+    prev_tokens = _tokenize_for_overlap(" ".join(previous_lines))
+    candidate_tokens = _tokenize_for_overlap(" ".join(candidate_lines))
+    max_overlap = min(max_tokens, len(prev_tokens), len(candidate_tokens))
+    for size in range(max_overlap, min_tokens - 1, -1):
+        if prev_tokens[-size:] == candidate_tokens[:size]:
+            return size
+    return 0
+
+
+def _estimate_overlapped_line_count(candidate_lines: Sequence[str], token_overlap: int) -> int:
+    if token_overlap <= 0:
+        return 0
+    consumed = 0
+    for index, line in enumerate(candidate_lines):
+        consumed += len(_tokenize_for_overlap(line))
+        if consumed >= token_overlap:
+            return index + 1
+    return len(candidate_lines)
+
+
 def _merge_full_translations(full_translations: Iterable[str]) -> str:
     merged_lines: list[str] = []
     for chunk in full_translations:
@@ -302,6 +334,10 @@ def _merge_full_translations(full_translations: Iterable[str]) -> str:
             ]:
                 overlap = size
                 break
+        if overlap == 0:
+            token_overlap = _find_token_overlap(merged_lines, candidate_lines)
+            if token_overlap > 0:
+                overlap = _estimate_overlapped_line_count(candidate_lines, token_overlap)
         merged_lines.extend(candidate_lines[overlap:])
     return "\n".join(merged_lines).strip()
 
@@ -312,6 +348,7 @@ def merge_batch_results(
     position_order: dict[str, int],
     placement_groups: Iterable[Sequence[TranslationPlacement]],
     full_translations: Iterable[str],
+    full_translation_override: str | None = None,
 ) -> TranslationResult:
     all_items: list[TranslationPlacement] = []
     for group in placement_groups:
@@ -340,7 +377,11 @@ def merge_batch_results(
 
     return TranslationResult(
         target_language=target_language,
-        full_translation=_merge_full_translations(full_translations),
+        full_translation=(
+            full_translation_override.strip()
+            if full_translation_override and full_translation_override.strip()
+            else _merge_full_translations(full_translations)
+        ),
         placements=deduped,
     )
 

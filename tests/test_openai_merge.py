@@ -56,6 +56,19 @@ def test_result_filtering_and_merge_rules():
     ]
 
 
+def test_full_translation_merge_handles_token_overlap_with_different_linebreaks():
+    merged = merge_batch_results(
+        target_language="English",
+        position_order=position_order_for_variant(POSITION_VARIANT_STANDARD),
+        placement_groups=[[]],
+        full_translations=[
+            "Blessed is he who comes\nin the name of the Lord",
+            "in the name of the Lord.\nHosanna in the highest",
+        ],
+    )
+    assert merged.full_translation == "Blessed is he who comes\nin the name of the Lord\nHosanna in the highest"
+
+
 class _FakeResponses:
     def __init__(self):
         self.last_kwargs = None

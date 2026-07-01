@@ -19,14 +19,17 @@ except ImportError:  # pragma: no cover - optional in local test env
 from app.config import Settings
 from app.models import (
     BatchLLMLogEntry,
+    CanonicalTranslationResult,
     JobLLMLog,
     JobManifest,
     JobStatus,
+    TRANSLATION_WORKFLOW_CANONICAL,
     TranslationPlacement,
     positions_for_variant,
 )
 from app.openai_service import OpenAIService, OpenAIServiceError, PermanentOpenAIError
 from app.pdf_processing import (
+    BatchSpec,
     PDFValidationError,
     build_batches,
     build_output_filename,
@@ -38,6 +41,7 @@ from app.pdf_processing import (
     sanitize_stem,
     validate_pdf_upload,
 )
+from app.prompts import build_placement_from_canonical_prompt
 
 LOGGER = logging.getLogger(__name__)
 
@@ -83,6 +87,9 @@ class JobStore:
     def llm_log_json_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "llm_log.json"
 
+    def canonical_translation_json_path(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "canonical_translation.json"
+
     def checkpoint_dir(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "checkpoints"
 
@@ -100,6 +107,9 @@ class JobStore:
 
     def _redis_input_key(self, job_id: str) -> str:
         return f"{self.redis_key_prefix}:job:{job_id}:input_pdf"
+
+    def _redis_canonical_key(self, job_id: str) -> str:
+        return f"{self.redis_key_prefix}:job:{job_id}:canonical_translation"
 
     def _redis_checkpoint_hash_key(self, job_id: str) -> str:
         return f"{self.redis_key_prefix}:job:{job_id}:batch_checkpoints"
@@ -152,6 +162,7 @@ class JobStore:
         page_count: int,
         llm_provider: str,
         llm_model: str | None,
+        translation_workflow: str,
         positioning_variant: str,
         testing_mode: bool,
         owned_batch_size_override: int | None = None,
@@ -168,6 +179,7 @@ class JobStore:
             target_language=target_language,
             llm_provider=llm_provider,
             llm_model=llm_model,
+            translation_workflow=translation_workflow,
             positioning_variant=positioning_variant,
             testing_mode=testing_mode,
             owned_batch_size_override=owned_batch_size_override,
@@ -179,7 +191,7 @@ class JobStore:
         LOGGER.info(
             (
                 "Created job job_id=%s filename=%s target_language=%s page_count=%s "
-                "testing_mode=%s provider=%s selected_model=%s positioning_variant=%s "
+                "testing_mode=%s provider=%s selected_model=%s workflow=%s positioning_variant=%s "
                 "selected_owned_batch_size=%s selected_context_pages=%s "
                 "effective_owned_batch_size=%s effective_context_pages=%s expires_at=%s"
             ),
@@ -190,6 +202,7 @@ class JobStore:
             manifest.testing_mode,
             manifest.llm_provider,
             manifest.llm_model or "default",
+            manifest.translation_workflow,
             manifest.positioning_variant,
             manifest.owned_batch_size_override if manifest.owned_batch_size_override is not None else "default",
             manifest.context_pages_override if manifest.context_pages_override is not None else "default",
@@ -402,6 +415,70 @@ class JobStore:
             LOGGER.exception("Failed to read llm log artifact from redis job_id=%s", job_id)
             return None
 
+    def save_canonical_translation(
+        self,
+        *,
+        job_id: str,
+        canonical: CanonicalTranslationResult,
+    ) -> None:
+        path = self.canonical_translation_json_path(job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = canonical.model_dump_json(indent=2).encode("utf-8")
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_bytes(payload)
+        tmp_path.replace(path)
+
+        if self.redis_client is None:
+            return
+        manifest = self.get_job(job_id)
+        if manifest is None:
+            return
+        try:
+            self.redis_client.set(
+                self._redis_canonical_key(job_id),
+                payload,
+                ex=self._redis_ttl_seconds(manifest),
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist canonical translation to redis job_id=%s", job_id)
+
+    def load_canonical_translation(self, job_id: str) -> CanonicalTranslationResult | None:
+        path = self.canonical_translation_json_path(job_id)
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return CanonicalTranslationResult.model_validate(payload)
+            except Exception:
+                LOGGER.exception("Failed to parse canonical translation path=%s", path)
+
+        if self.redis_client is None:
+            return None
+        try:
+            cached = self.redis_client.get(self._redis_canonical_key(job_id))
+        except Exception:
+            LOGGER.exception("Failed to read canonical translation from redis job_id=%s", job_id)
+            return None
+        if cached is None:
+            return None
+        try:
+            payload = json.loads(cached.decode("utf-8"))
+            canonical = CanonicalTranslationResult.model_validate(payload)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(canonical.model_dump_json(indent=2), encoding="utf-8")
+            return canonical
+        except Exception:
+            LOGGER.exception("Failed to parse cached canonical translation job_id=%s", job_id)
+            return None
+
+    def clear_canonical_translation(self, job_id: str) -> None:
+        path = self.canonical_translation_json_path(job_id)
+        if path.exists():
+            with contextlib.suppress(Exception):
+                path.unlink()
+        if self.redis_client is not None:
+            with contextlib.suppress(Exception):
+                self.redis_client.delete(self._redis_canonical_key(job_id))
+
     def create_processing_lock(self, job_id: str):
         if self.redis_client is None:
             return None
@@ -547,6 +624,32 @@ def _sort_batch_placements(
     return sorted(placements, key=lambda item: (item.page, position_order.get(item.position, 999)))
 
 
+def _canonical_reference_text(canonical: CanonicalTranslationResult) -> str:
+    lines: list[str] = [
+        "CANONICAL_TRANSLATION_REFERENCE",
+        "",
+        "FULL_TRANSLATION:",
+        canonical.full_translation or "[empty]",
+        "",
+        "ALIGNED_LINES:",
+    ]
+    if not canonical.aligned_lines:
+        lines.append("[none]")
+    else:
+        for idx, item in enumerate(canonical.aligned_lines, start=1):
+            lines.append(f"{idx}. SRC: {item.source_text}")
+            lines.append(f"   TR: {item.translated_text}")
+    lines.extend(
+        [
+            "",
+            "Use this canonical reference as translation truth.",
+            "Do not independently re-translate wording unless OCR is clearly mismatched and correction is essential.",
+            "Prefer fragments that are exact substrings of translated canonical lines where possible.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 async def process_job(
     *,
     job_store: JobStore,
@@ -596,7 +699,7 @@ async def process_job(
     LOGGER.info(
         (
             "Starting job job_id=%s page_count=%s target_language=%s testing_mode=%s "
-            "provider=%s selected_model=%s position_variant=%s "
+            "provider=%s selected_model=%s workflow=%s position_variant=%s "
             "selected_batch_size=%s selected_context_pages=%s "
             "effective_batch_size=%s effective_context_pages=%s "
             "render_dpi=%s image_max_dimension=%s max_parallel_batches=%s"
@@ -607,6 +710,7 @@ async def process_job(
         manifest.testing_mode,
         manifest.llm_provider,
         manifest.llm_model or "default",
+        manifest.translation_workflow,
         manifest.positioning_variant,
         manifest.owned_batch_size_override if manifest.owned_batch_size_override is not None else "default",
         manifest.context_pages_override if manifest.context_pages_override is not None else "default",
@@ -681,10 +785,64 @@ async def process_job(
             max_parallel_batches,
         )
 
+        is_canonical_mode = manifest.translation_workflow == TRANSLATION_WORKFLOW_CANONICAL
+        canonical_result: CanonicalTranslationResult | None = None
+        canonical_reference_block: str | None = None
+
         total_batches = len(batches)
         llm_entries_by_index: dict[int, BatchLLMLogEntry] = {}
         placement_groups_by_index: dict[int, list[TranslationPlacement]] = {}
         full_translations_by_index: dict[int, str] = {}
+        analysis_base_progress = 0.40 if is_canonical_mode else 0.25
+        analysis_span = 0.45 if is_canonical_mode else 0.60
+
+        if is_canonical_mode:
+            canonical_result = job_store.load_canonical_translation(job_id)
+            if canonical_result is None:
+                job_store.set_status(
+                    job_id=job_id,
+                    status=JobStatus.ANALYSING,
+                    message="Building canonical full-score translation...",
+                    progress=0.33,
+                    current_batch=0,
+                    total_batches=total_batches if total_batches else None,
+                )
+                canonical_batch = BatchSpec(
+                    index=0,
+                    owned_start=1,
+                    owned_end=page_count,
+                    supplied_start=1,
+                    supplied_end=page_count,
+                )
+                canonical_result, canonical_log = await openai_service.translate_canonical(
+                    batch=canonical_batch,
+                    target_language=manifest.target_language,
+                    image_paths=rendered_paths,
+                    provider=manifest.llm_provider,
+                    model_name=manifest.llm_model,
+                    position_variant=manifest.positioning_variant,
+                    user_header_override=(
+                        f"target_language: {manifest.target_language}\n"
+                        "MODE: canonical_translation_only\n"
+                        f"SUPPLIED_PAGES: 1-{page_count}\n"
+                        f"OWNED_PAGES: 1-{page_count}\n"
+                        "Return canonical full translation and aligned lines."
+                    ),
+                )
+                llm_entries_by_index[0] = canonical_log
+                job_store.save_canonical_translation(job_id=job_id, canonical=canonical_result)
+            else:
+                LOGGER.info("Loaded cached canonical translation job_id=%s", job_id)
+
+            canonical_reference_block = _canonical_reference_text(canonical_result)
+            job_store.set_status(
+                job_id=job_id,
+                status=JobStatus.ANALYSING,
+                message="Canonical translation ready. Placing text on pages...",
+                progress=0.40,
+                current_batch=0,
+                total_batches=total_batches if total_batches else None,
+            )
 
         checkpoints = job_store.load_batch_checkpoints(job_id)
         for checkpoint_index, (placements, full_translation, batch_log) in checkpoints.items():
@@ -721,6 +879,12 @@ async def process_job(
                 provider=manifest.llm_provider,
                 model_name=manifest.llm_model,
                 position_variant=manifest.positioning_variant,
+                system_prompt_override=(
+                    build_placement_from_canonical_prompt(manifest.positioning_variant)
+                    if is_canonical_mode
+                    else None
+                ),
+                extra_user_text_blocks=[canonical_reference_block] if canonical_reference_block else None,
             )
             filtered = clean_and_filter_batch_placements(
                 placements=batch_result.placements,
@@ -739,7 +903,11 @@ async def process_job(
                 batch_spec.owned_start,
                 batch_spec.owned_end,
                 _sort_batch_placements(filtered, position_order),
-                batch_result.full_translation,
+                (
+                    canonical_result.full_translation
+                    if is_canonical_mode and canonical_result is not None
+                    else batch_result.full_translation
+                ),
                 batch_log,
             )
 
@@ -752,7 +920,7 @@ async def process_job(
                     if completed_batches
                     else "Analysing score pages..."
                 ),
-                progress=0.25 + (completed_batches / total_batches * 0.60),
+                progress=analysis_base_progress + (completed_batches / total_batches * analysis_span),
                 current_batch=completed_batches,
                 total_batches=total_batches,
             )
@@ -790,7 +958,9 @@ async def process_job(
                         full_translations_by_index[batch_index] = full_translation
                         llm_entries_by_index[batch_index] = batch_log
                         completed_batches += 1
-                        batch_progress = 0.25 + completed_batches / total_batches * 0.60
+                        batch_progress = (
+                            analysis_base_progress + completed_batches / total_batches * analysis_span
+                        )
                         job_store.set_status(
                             job_id=job_id,
                             status=JobStatus.ANALYSING,
@@ -815,6 +985,11 @@ async def process_job(
             position_order=position_order,
             placement_groups=placement_groups,
             full_translations=full_translations,
+            full_translation_override=(
+                canonical_result.full_translation
+                if is_canonical_mode and canonical_result is not None
+                else None
+            ),
         )
         job_store.translation_json_path(job_id).write_text(
             merged.model_dump_json(indent=2),
@@ -843,7 +1018,7 @@ async def process_job(
                 settings.openai_reasoning_effort if manifest.llm_provider == "openai" else None
             ),
             source_pdf_page_count=page_count,
-            total_batches=total_batches,
+            total_batches=len(llm_entries),
             total_pages_sent=sum(entry.pages_sent_count for entry in llm_entries),
             totals={
                 "input_tokens": total_input_tokens,
@@ -890,6 +1065,7 @@ async def process_job(
         )
         job_store.persist_output_pdf_artifact(job_id=job_id)
         job_store.clear_batch_checkpoints(job_id)
+        job_store.clear_canonical_translation(job_id)
         job_store.mark_complete(job_id=job_id, download_filename=download_filename)
     except PDFValidationError as exc:
         LOGGER.warning("Validation failed job_id=%s reason=%s", job_id, exc)
