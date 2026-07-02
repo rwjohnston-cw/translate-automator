@@ -77,6 +77,22 @@ class IPALookupResult:
     entries: dict[str, str | None]
 
 
+@dataclass(frozen=True)
+class IPATokenEntry:
+    text: str
+    ipa: str | None
+    matched: str | None = None
+
+
+@dataclass(frozen=True)
+class IPATokensResult:
+    variant: str | None
+    tokens: tuple[IPATokenEntry, ...]
+
+
+CJK_VARIANTS = frozenset({"ja", "zh_hans", "zh_hant", "yue"})
+
+
 def _normalize_language_key(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value.strip().casefold())
     normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
@@ -155,6 +171,69 @@ def lookup_words(*, variant_code: str, words: list[str]) -> IPALookupResult:
         ipa = dictionary.get(normalized)
         entries[normalize_display_text(word)] = ipa
     return IPALookupResult(variant=variant_code, entries=entries)
+
+
+def _lookup_key_in_dictionary(dictionary: dict[str, str], key: str) -> str | None:
+    normalized = normalize_dict_key(key)
+    if not normalized:
+        return None
+    return dictionary.get(normalized)
+
+
+def _lookup_per_character(dictionary: dict[str, str], text: str) -> str | None:
+    readings: list[str] = []
+    for char in text:
+        if not char.strip():
+            continue
+        ipa = _lookup_key_in_dictionary(dictionary, char)
+        if ipa is None:
+            return None
+        readings.append(ipa)
+    if not readings:
+        return None
+    return " ".join(readings)
+
+
+def _lookup_segment_token(
+    *,
+    dictionary: dict[str, str],
+    variant_code: str,
+    surface: str,
+    lookup_keys: tuple[str, ...],
+) -> IPATokenEntry:
+    display = normalize_display_text(surface)
+    for key in lookup_keys:
+        ipa = _lookup_key_in_dictionary(dictionary, key)
+        if ipa is None:
+            continue
+        matched: str | None = None
+        if normalize_dict_key(key) != normalize_dict_key(display):
+            matched = normalize_display_text(key)
+        return IPATokenEntry(text=display, ipa=ipa, matched=matched)
+
+    if variant_code in CJK_VARIANTS and lookup_keys:
+        per_char = _lookup_per_character(dictionary, display)
+        if per_char is not None:
+            return IPATokenEntry(text=display, ipa=per_char)
+
+    return IPATokenEntry(text=display, ipa=None)
+
+
+def lookup_tokens(*, variant_code: str, text: str) -> IPATokensResult:
+    from app.segmentation import segment
+
+    dictionary = _load_dictionary(variant_code)
+    segment_tokens = segment(variant_code=variant_code, text=text)
+    entries = tuple(
+        _lookup_segment_token(
+            dictionary=dictionary,
+            variant_code=variant_code,
+            surface=token.text,
+            lookup_keys=token.lookup_keys if token.is_word else (),
+        )
+        for token in segment_tokens
+    )
+    return IPATokensResult(variant=variant_code, tokens=entries)
 
 
 def tokenize_source_text(text: str) -> list[str]:

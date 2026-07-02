@@ -47,8 +47,8 @@
   let transient404Count = 0;
   let textResultLoaded = false;
   let textResultPayload = null;
-  let ipaEntries = {};
-  let activePopoverWord = null;
+  let ipaTokens = [];
+  let activePopoverToken = null;
 
   function stopPolling() {
     if (timer) {
@@ -118,50 +118,23 @@
       .replaceAll("'", "&#39;");
   }
 
-  function tokenizeText(text) {
-    const tokens = [];
-    const normalized = normalizeUnicode(text);
-    const pattern = /[\p{L}\p{M}\p{N}'’-]+|[^\S\p{L}\p{M}\p{N}'’-]+|\s+/gu;
-    let match;
-    while ((match = pattern.exec(normalized)) !== null) {
-      tokens.push(match[0]);
-    }
-    return tokens;
-  }
-
-  function isWordToken(token) {
-    return /[\p{L}\p{M}\p{N}]/u.test(token);
-  }
-
-  function resolveSourceLangCode(sourceLanguage) {
-    const key = normalizeUnicode(sourceLanguage || "")
-      .trim()
-      .toLowerCase();
-    if (key.includes("german") || key === "de" || key === "deutsch") return "de";
-    if (key.includes("french") || key === "fr" || key === "français") return "fr";
-    if (key.includes("spanish") || key === "es" || key === "español") return "es";
-    if (key.includes("italian") || key === "it" || key === "italiano") return "it";
-    if (key.includes("english") || key === "en") return "en";
-    return "";
-  }
-
   function clearElement(element) {
     while (element.firstChild) {
       element.removeChild(element.firstChild);
     }
   }
 
-  function appendSourceToken(parent, token, hasIpa) {
-    if (isWordToken(token) && hasIpa) {
+  function appendSourceToken(parent, token) {
+    if (token.ipa) {
       const span = document.createElement("span");
       span.className = "ipa-word has-ipa";
       span.tabIndex = 0;
-      span.textContent = token;
+      span.textContent = token.text;
       span.addEventListener("mouseenter", () => {
         showPopover(token, span);
       });
       span.addEventListener("mouseleave", () => {
-        if (activePopoverWord === token) {
+        if (activePopoverToken === token) {
           hidePopover();
         }
       });
@@ -172,22 +145,24 @@
       parent.appendChild(span);
       return;
     }
-    parent.appendChild(document.createTextNode(token));
+    parent.appendChild(document.createTextNode(token.text));
   }
 
   function hidePopover() {
-    activePopoverWord = null;
+    activePopoverToken = null;
     ipaPopover.classList.add("hidden");
   }
 
-  function showPopover(word, target) {
-    const ipa = ipaEntries[word];
-    if (!ipa) {
+  function showPopover(token, target) {
+    if (!token?.ipa) {
       hidePopover();
       return;
     }
-    activePopoverWord = word;
-    ipaPopover.innerHTML = `<strong>${escapeHtml(word)}</strong><br /><span class="ipa-value">${escapeHtml(ipa)}</span>`;
+    activePopoverToken = token;
+    const matchedLine = token.matched
+      ? `<span class="ipa-matched">${escapeHtml(token.text)} → ${escapeHtml(token.matched)}</span><br />`
+      : `<strong>${escapeHtml(token.text)}</strong><br />`;
+    ipaPopover.innerHTML = `${matchedLine}<span class="ipa-value">${escapeHtml(token.ipa)}</span>`;
     ipaPopover.classList.remove("hidden");
 
     const rect = target.getBoundingClientRect();
@@ -215,13 +190,13 @@
       return;
     }
 
-    if (!textResultPayload || !textResultPayload.ipa_supported) {
+    if (!textResultPayload || !textResultPayload.ipa_supported || !ipaTokens.length) {
       sourceTextView.textContent = normalizedText;
       return;
     }
 
-    for (const token of tokenizeText(normalizedText)) {
-      appendSourceToken(sourceTextView, token, Boolean(isWordToken(token) && ipaEntries[token]));
+    for (const token of ipaTokens) {
+      appendSourceToken(sourceTextView, token);
     }
   }
 
@@ -236,43 +211,40 @@
     hidePopover();
   }
 
-  function uniqueWordsFromText(text) {
-    const seen = new Set();
-    const words = [];
-    for (const token of tokenizeText(text || "")) {
-      if (!isWordToken(token)) continue;
-      const key = token.toCaseFold ? token.toCaseFold() : token.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      words.push(token);
-    }
-    return words;
+  function resolveSourceLangCode(sourceLanguage) {
+    const key = normalizeUnicode(sourceLanguage || "")
+      .trim()
+      .toLowerCase();
+    if (key.includes("german") || key === "de" || key === "deutsch") return "de";
+    if (key.includes("french") || key === "fr" || key === "français") return "fr";
+    if (key.includes("spanish") || key === "es" || key === "español") return "es";
+    if (key.includes("italian") || key === "it" || key === "italiano") return "it";
+    if (key.includes("english") || key === "en") return "en";
+    if (key.includes("japanese") || key === "ja") return "ja";
+    if (key.includes("chinese") || key.includes("mandarin") || key === "zh") return "zh";
+    return "";
   }
 
-  async function fetchIpaEntries(variant) {
+  async function fetchIpaTokens(variant) {
     if (!textResultPayload || !textResultPayload.ipa_supported || !window.jobConfig.jobId) {
-      ipaEntries = {};
-      return;
-    }
-    const words = uniqueWordsFromText(normalizeUnicode(textResultPayload.full_source_text));
-    if (!words.length) {
-      ipaEntries = {};
+      ipaTokens = [];
       return;
     }
 
-    const response = await fetch(`/api/jobs/${window.jobConfig.jobId}/ipa`, {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ variant, words }),
+    const params = new URLSearchParams();
+    if (variant) {
+      params.set("variant", variant);
+    }
+    const query = params.toString();
+    const url = `/api/jobs/${window.jobConfig.jobId}/ipa-tokens${query ? `?${query}` : ""}`;
+    const response = await fetch(url, {
+      headers: { Accept: "application/json" },
     });
     if (!response.ok) {
       throw new Error("Could not load IPA pronunciations.");
     }
     const payload = await response.json();
-    ipaEntries = payload.entries || {};
+    ipaTokens = payload.tokens || [];
   }
 
   function selectedIpaVariant() {
@@ -314,13 +286,13 @@
         ipaControls.classList.add("hidden");
       }
       ipaUnsupportedNote.classList.add("hidden");
-      await fetchIpaEntries(selectedIpaVariant());
+      await fetchIpaTokens(selectedIpaVariant());
     } else {
       ipaControls.classList.add("hidden");
       ipaUnsupportedNote.classList.remove("hidden");
       ipaUnsupportedNote.textContent =
         "IPA pronunciation lookup is not available for this source language.";
-      ipaEntries = {};
+      ipaTokens = [];
     }
 
     const sourceLang = resolveSourceLangCode(textResultPayload.source_language);
@@ -429,7 +401,7 @@
   tabTranslation.addEventListener("click", () => setActiveTab("translation"));
   ipaVariantSelect.addEventListener("change", async () => {
     try {
-      await fetchIpaEntries(selectedIpaVariant());
+      await fetchIpaTokens(selectedIpaVariant());
       renderSourceTextView(textResultPayload?.full_source_text || "");
     } catch (error) {
       errorArea.textContent = error.message || "Could not load IPA pronunciations.";

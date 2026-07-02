@@ -15,7 +15,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from app.config import Settings
-from app.ipa_lookup import lookup_words, resolve_ipa_language, variant_label
+from app.ipa_lookup import lookup_tokens, resolve_ipa_language, variant_label
 from app.jobs import JobStore, process_job
 from app.models import (
     LLM_PROVIDER_DEEPSEEK,
@@ -40,7 +40,29 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+def static_assets_version() -> str:
+    latest_mtime = 0.0
+    if STATIC_DIR.is_dir():
+        for path in STATIC_DIR.iterdir():
+            if path.is_file():
+                latest_mtime = max(latest_mtime, path.stat().st_mtime)
+    if latest_mtime:
+        return str(int(latest_mtime))
+    return "1"
+
+
+def static_url(path: str) -> str:
+    cleaned = path.lstrip("/")
+    if cleaned.startswith("static/"):
+        cleaned = cleaned[len("static/") :]
+    return f"/static/{cleaned}?v={static_assets_version()}"
+
+
+templates.env.globals["static_url"] = static_url
 
 LANGUAGE_OPTIONS = [
     "English",
@@ -151,11 +173,6 @@ WORKFLOW_MODE_OPTIONS = [
         "label": "Two-pass: canonical translation, then placement",
     },
 ]
-
-
-class IPALookupRequest(BaseModel):
-    words: list[str] = Field(default_factory=list, max_length=500)
-    variant: str | None = None
 
 
 def _resolve_target_language(target_language: str, custom_target_language: str | None) -> str:
@@ -698,8 +715,8 @@ def create_app(
             }
         )
 
-    @app.post("/api/jobs/{job_id}/ipa")
-    async def job_ipa_lookup(job_id: str, payload: IPALookupRequest):
+    @app.get("/api/jobs/{job_id}/ipa-tokens")
+    async def job_ipa_tokens(job_id: str, variant: str | None = None):
         app.state.job_store.cleanup_expired()
         manifest = app.state.job_store.get_job(job_id)
         if manifest is None:
@@ -718,11 +735,12 @@ def create_app(
                     "ipa_supported": False,
                     "source_language": text_result.source_language,
                     "variant": None,
-                    "entries": {},
+                    "variant_label": None,
+                    "tokens": [],
                 }
             )
 
-        selected_variant = (payload.variant or language_info.default_variant or "").strip()
+        selected_variant = (variant or language_info.default_variant or "").strip()
         if selected_variant not in language_info.variants:
             allowed = ", ".join(language_info.variants)
             raise HTTPException(
@@ -730,26 +748,24 @@ def create_app(
                 detail=f"Invalid IPA variant '{selected_variant}'. Allowed values: {allowed}.",
             )
 
-        unique_words: list[str] = []
-        seen: set[str] = set()
-        for word in payload.words:
-            cleaned = word.strip()
-            if not cleaned:
-                continue
-            key = cleaned.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            unique_words.append(cleaned)
-
-        lookup = lookup_words(variant_code=selected_variant, words=unique_words)
+        lookup = lookup_tokens(
+            variant_code=selected_variant,
+            text=text_result.full_source_text,
+        )
         return JSONResponse(
             {
                 "ipa_supported": True,
                 "source_language": text_result.source_language,
                 "variant": lookup.variant,
                 "variant_label": variant_label(lookup.variant or ""),
-                "entries": lookup.entries,
+                "tokens": [
+                    {
+                        "text": entry.text,
+                        "ipa": entry.ipa,
+                        **({"matched": entry.matched} if entry.matched else {}),
+                    }
+                    for entry in lookup.tokens
+                ],
             }
         )
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -246,15 +247,18 @@ def test_text_result_and_ipa_endpoints(tmp_path: Path):
     assert payload["ipa_supported"] is True
     assert payload["default_ipa_variant"] == "de"
 
-    ipa_response = client.post(
-        f"/api/jobs/{manifest.job_id}/ipa",
-        json={"variant": "de", "words": ["Guten", "Welt", "missing"]},
+    ipa_response = client.get(
+        f"/api/jobs/{manifest.job_id}/ipa-tokens",
+        params={"variant": "de"},
     )
     assert ipa_response.status_code == 200
     ipa_payload = ipa_response.json()
     assert ipa_payload["ipa_supported"] is True
     assert ipa_payload["variant"] == "de"
-    assert "entries" in ipa_payload
+    assert "tokens" in ipa_payload
+    token_texts = [token["text"] for token in ipa_payload["tokens"]]
+    assert token_texts == ["Guten", " ", "Tag", " ", "Welt"]
+    assert ipa_payload["tokens"][0]["ipa"] is not None
 
     client.close()
 
@@ -300,11 +304,61 @@ def test_ipa_endpoint_reports_unsupported_language(tmp_path: Path):
     assert text_result_response.status_code == 200
     assert text_result_response.json()["ipa_supported"] is False
 
-    ipa_response = client.post(
-        f"/api/jobs/{manifest.job_id}/ipa",
-        json={"words": ["Kyrie"]},
-    )
+    ipa_response = client.get(f"/api/jobs/{manifest.job_id}/ipa-tokens")
     assert ipa_response.status_code == 200
     assert ipa_response.json()["ipa_supported"] is False
+    assert ipa_response.json()["tokens"] == []
+    client.close()
+
+
+def test_ipa_tokens_endpoint_japanese(tmp_path: Path):
+    pytest.importorskip("sudachipy")
+    settings = Settings(
+        openai_api_key="sk-test",
+        max_upload_mb=1,
+        max_pages=100,
+        job_root=tmp_path / "jobs",
+        cleanup_interval_seconds=3600,
+    )
+    app = create_app(settings=settings)
+    client = TestClient(app)
+    store = app.state.job_store
+    manifest = store.create_job(
+        original_filename="score.pdf",
+        target_language="English",
+        page_count=1,
+        llm_provider="openai",
+        llm_model=None,
+        llm_reasoning_effort=None,
+        translation_workflow="batch_translate_and_place",
+        positioning_variant="standard_3",
+        testing_mode=False,
+    )
+    store.update_job(
+        manifest.job_id,
+        status=JobStatus.COMPLETE,
+        text_result_available=True,
+    )
+    store.save_text_result(
+        job_id=manifest.job_id,
+        text_result=JobTextResult(
+            source_language="Japanese",
+            full_source_text="今日も薊の紫に",
+            target_language="English",
+            full_translation="Today too, to the purple thistle",
+        ),
+    )
+
+    ipa_response = client.get(
+        f"/api/jobs/{manifest.job_id}/ipa-tokens",
+        params={"variant": "ja"},
+    )
+    assert ipa_response.status_code == 200
+    payload = ipa_response.json()
+    assert payload["ipa_supported"] is True
+    assert payload["variant"] == "ja"
+    assert "".join(token["text"] for token in payload["tokens"]) == "今日も薊の紫に"
+    word_tokens = [token for token in payload["tokens"] if token["ipa"]]
+    assert len(word_tokens) >= 4
     client.close()
 
