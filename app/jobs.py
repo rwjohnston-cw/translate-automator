@@ -13,8 +13,10 @@ from typing import Any
 
 try:
     import redis
+    from redis.exceptions import LockNotOwnedError
 except ImportError:  # pragma: no cover - optional in local test env
     redis = None  # type: ignore[assignment]
+    LockNotOwnedError = None  # type: ignore[misc, assignment]
 
 from app.config import Settings
 from app.models import (
@@ -45,6 +47,10 @@ from app.pdf_processing import (
 from app.prompts import build_placement_from_canonical_prompt
 
 LOGGER = logging.getLogger(__name__)
+
+
+class ProcessingLockLostError(Exception):
+    """Raised when this worker loses exclusive ownership of a job processing lock."""
 
 
 class JobStore:
@@ -553,6 +559,23 @@ class JobStore:
             blocking=False,
         )
 
+    def is_processing_locked(self, job_id: str) -> bool:
+        lock = self.create_processing_lock(job_id)
+        if lock is None:
+            return False
+        try:
+            return bool(lock.locked())
+        except Exception:
+            LOGGER.exception("Failed to check processing lock job_id=%s", job_id)
+            return False
+
+    def touch_job(self, job_id: str) -> None:
+        manifest = self.get_job(job_id)
+        if manifest is None:
+            return
+        manifest.touch()
+        self._write_manifest(manifest)
+
     def save_batch_checkpoint(
         self,
         *,
@@ -752,6 +775,12 @@ async def process_job(
     started = perf_counter()
     processing_lock = job_store.create_processing_lock(job_id)
     lock_heartbeat_task: asyncio.Task[None] | None = None
+    lock_lost: asyncio.Event | None = None
+
+    def _raise_if_lock_lost() -> None:
+        if lock_lost is not None and lock_lost.is_set():
+            raise ProcessingLockLostError(job_id)
+
     if processing_lock is not None:
         try:
             acquired = bool(processing_lock.acquire(blocking=False))
@@ -762,6 +791,7 @@ async def process_job(
             LOGGER.info("Processing already active elsewhere job_id=%s", job_id)
             return
 
+        lock_lost = asyncio.Event()
         heartbeat_interval = max(5, settings.job_processing_lock_heartbeat_seconds)
         lock_ttl = max(30, settings.job_processing_lock_ttl_seconds)
 
@@ -770,6 +800,14 @@ async def process_job(
                 await asyncio.sleep(heartbeat_interval)
                 try:
                     processing_lock.extend(lock_ttl, replace_ttl=True)
+                    job_store.touch_job(job_id)
+                except LockNotOwnedError:
+                    LOGGER.warning(
+                        "Lost processing lock; stopping worker job_id=%s",
+                        job_id,
+                    )
+                    lock_lost.set()
+                    return
                 except Exception:
                     LOGGER.exception("Failed to extend processing lock job_id=%s", job_id)
 
@@ -816,6 +854,7 @@ async def process_job(
     )
 
     try:
+        _raise_if_lock_lost()
         job_store.set_status(
             job_id=job_id,
             status=JobStatus.VALIDATING,
@@ -1049,12 +1088,14 @@ async def process_job(
                 ] = []
 
                 async def _run_with_limit(batch_spec):
+                    _raise_if_lock_lost()
                     async with semaphore:
                         return await _run_single_batch(batch_spec)
 
                 tasks = [asyncio.create_task(_run_with_limit(batch_spec)) for batch_spec in pending_batches]
                 try:
                     for completed_task in asyncio.as_completed(tasks):
+                        _raise_if_lock_lost()
                         (
                             batch_index,
                             owned_start,
@@ -1227,6 +1268,8 @@ async def process_job(
         job_store.clear_batch_checkpoints(job_id)
         job_store.clear_canonical_translation(job_id)
         job_store.mark_complete(job_id=job_id, download_filename=download_filename)
+    except ProcessingLockLostError:
+        LOGGER.info("Stopped processing after losing lock job_id=%s", job_id)
     except PDFValidationError as exc:
         LOGGER.warning("Validation failed job_id=%s reason=%s", job_id, exc)
         job_store.mark_failed(job_id=job_id, message=str(exc))

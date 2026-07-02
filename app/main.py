@@ -460,6 +460,8 @@ def create_app(
         last_attempt = app.state.last_resume_attempt.get(manifest.job_id)
         if last_attempt and (now - last_attempt).total_seconds() < cooldown:
             return
+        if app.state.job_store.is_processing_locked(manifest.job_id):
+            return
         app.state.last_resume_attempt[manifest.job_id] = now
         _start_processing_task(manifest.job_id, reason="stale_job_resume")
 
