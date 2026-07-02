@@ -245,6 +245,8 @@ def test_gemini_response_schema_is_inline_and_ref_free(tmp_path: Path):
     assert fake_http.last_kwargs is not None
     response_schema = fake_http.last_kwargs["json"]["generationConfig"]["responseSchema"]
     assert response_schema["type"] == "OBJECT"
+    assert response_schema["properties"]["source_language"]["type"] == "STRING"
+    assert response_schema["properties"]["full_source_text"]["type"] == "STRING"
     assert response_schema["properties"]["full_translation"]["type"] == "STRING"
     assert response_schema["properties"]["placements"]["items"]["type"] == "OBJECT"
     assert response_schema["properties"]["placements"]["items"]["properties"]["position"]["enum"] == [

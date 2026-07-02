@@ -348,7 +348,11 @@ def merge_batch_results(
     position_order: dict[str, int],
     placement_groups: Iterable[Sequence[TranslationPlacement]],
     full_translations: Iterable[str],
+    full_source_texts: Iterable[str] | None = None,
+    source_language: str | None = None,
     full_translation_override: str | None = None,
+    full_source_text_override: str | None = None,
+    source_language_override: str | None = None,
 ) -> TranslationResult:
     all_items: list[TranslationPlacement] = []
     for group in placement_groups:
@@ -375,7 +379,16 @@ def merge_batch_results(
             )
         )
 
+    resolved_source_language = (source_language_override or source_language or "").strip()
+    resolved_full_source_text = (
+        full_source_text_override.strip()
+        if full_source_text_override and full_source_text_override.strip()
+        else _merge_full_translations(full_source_texts or [])
+    )
+
     return TranslationResult(
+        source_language=resolved_source_language,
+        full_source_text=resolved_full_source_text,
         target_language=target_language,
         full_translation=(
             full_translation_override.strip()

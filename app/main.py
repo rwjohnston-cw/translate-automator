@@ -12,8 +12,10 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 
 from app.config import Settings
+from app.ipa_lookup import lookup_words, resolve_ipa_language, variant_label
 from app.jobs import JobStore, process_job
 from app.models import (
     LLM_PROVIDER_DEEPSEEK,
@@ -149,6 +151,11 @@ WORKFLOW_MODE_OPTIONS = [
         "label": "Two-pass: canonical translation, then placement",
     },
 ]
+
+
+class IPALookupRequest(BaseModel):
+    words: list[str] = Field(default_factory=list, max_length=500)
+    variant: str | None = None
 
 
 def _resolve_target_language(target_language: str, custom_target_language: str | None) -> str:
@@ -639,10 +646,13 @@ def create_app(
 
         download_url = None
         log_url = None
+        text_result_url = None
         if manifest.status == JobStatus.COMPLETE and manifest.output_available:
             download_url = f"/api/jobs/{manifest.job_id}/download"
         if manifest.status == JobStatus.COMPLETE and manifest.log_available:
             log_url = f"/api/jobs/{manifest.job_id}/log"
+        if manifest.status == JobStatus.COMPLETE and manifest.text_result_available:
+            text_result_url = f"/api/jobs/{manifest.job_id}/text-result"
 
         return JSONResponse(
             {
@@ -653,8 +663,93 @@ def create_app(
                 "total_batches": manifest.total_batches,
                 "download_url": download_url,
                 "log_url": log_url,
+                "text_result_url": text_result_url,
                 "error": manifest.error,
                 "updated_at": manifest.updated_at.isoformat(),
+            }
+        )
+
+    @app.get("/api/jobs/{job_id}/text-result")
+    async def job_text_result(job_id: str):
+        app.state.job_store.cleanup_expired()
+        manifest = app.state.job_store.get_job(job_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        if manifest.status != JobStatus.COMPLETE or not manifest.text_result_available:
+            raise HTTPException(status_code=404, detail="Text result not found.")
+
+        text_result = app.state.job_store.load_text_result(job_id)
+        if text_result is None:
+            raise HTTPException(status_code=404, detail="Text result not found.")
+
+        language_info = resolve_ipa_language(text_result.source_language)
+        variants = [
+            {"code": code, "label": variant_label(code)} for code in language_info.variants
+        ]
+        return JSONResponse(
+            {
+                "source_language": text_result.source_language,
+                "full_source_text": text_result.full_source_text,
+                "target_language": text_result.target_language,
+                "full_translation": text_result.full_translation,
+                "ipa_supported": language_info.ipa_supported,
+                "ipa_variants": variants,
+                "default_ipa_variant": language_info.default_variant,
+            }
+        )
+
+    @app.post("/api/jobs/{job_id}/ipa")
+    async def job_ipa_lookup(job_id: str, payload: IPALookupRequest):
+        app.state.job_store.cleanup_expired()
+        manifest = app.state.job_store.get_job(job_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        if manifest.status != JobStatus.COMPLETE or not manifest.text_result_available:
+            raise HTTPException(status_code=404, detail="Text result not found.")
+
+        text_result = app.state.job_store.load_text_result(job_id)
+        if text_result is None:
+            raise HTTPException(status_code=404, detail="Text result not found.")
+
+        language_info = resolve_ipa_language(text_result.source_language)
+        if not language_info.ipa_supported:
+            return JSONResponse(
+                {
+                    "ipa_supported": False,
+                    "source_language": text_result.source_language,
+                    "variant": None,
+                    "entries": {},
+                }
+            )
+
+        selected_variant = (payload.variant or language_info.default_variant or "").strip()
+        if selected_variant not in language_info.variants:
+            allowed = ", ".join(language_info.variants)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid IPA variant '{selected_variant}'. Allowed values: {allowed}.",
+            )
+
+        unique_words: list[str] = []
+        seen: set[str] = set()
+        for word in payload.words:
+            cleaned = word.strip()
+            if not cleaned:
+                continue
+            key = cleaned.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_words.append(cleaned)
+
+        lookup = lookup_words(variant_code=selected_variant, words=unique_words)
+        return JSONResponse(
+            {
+                "ipa_supported": True,
+                "source_language": text_result.source_language,
+                "variant": lookup.variant,
+                "variant_label": variant_label(lookup.variant or ""),
+                "entries": lookup.entries,
             }
         )
 

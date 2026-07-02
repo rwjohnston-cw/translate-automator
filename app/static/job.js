@@ -11,6 +11,17 @@
   const downloadLink = document.getElementById("download-link");
   const downloadLogLink = document.getElementById("download-log-link");
   const errorArea = document.getElementById("error-area");
+  const jobLayout = document.getElementById("job-layout");
+  const textPanel = document.getElementById("text-panel");
+  const textPanelMeta = document.getElementById("text-panel-meta");
+  const ipaControls = document.getElementById("ipa-controls");
+  const ipaVariantSelect = document.getElementById("ipa-variant-select");
+  const ipaUnsupportedNote = document.getElementById("ipa-unsupported-note");
+  const tabSource = document.getElementById("tab-source");
+  const tabTranslation = document.getElementById("tab-translation");
+  const sourceTextView = document.getElementById("source-text-view");
+  const translationTextView = document.getElementById("translation-text-view");
+  const ipaPopover = document.getElementById("ipa-popover");
 
   const STAGES = [
     { id: "queued", label: "Queued", statuses: ["queued"] },
@@ -34,6 +45,10 @@
   const MAX_POLL_MS = 20 * 60 * 1000;
   const MAX_TRANSIENT_404 = 15;
   let transient404Count = 0;
+  let textResultLoaded = false;
+  let textResultPayload = null;
+  let ipaEntries = {};
+  let activePopoverWord = null;
 
   function stopPolling() {
     if (timer) {
@@ -90,6 +105,257 @@
     }`;
   }
 
+  function normalizeUnicode(text) {
+    return String(text || "").normalize("NFC");
+  }
+
+  function escapeHtml(value) {
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }
+
+  function tokenizeText(text) {
+    const tokens = [];
+    const normalized = normalizeUnicode(text);
+    const pattern = /[\p{L}\p{M}\p{N}'’-]+|[^\S\p{L}\p{M}\p{N}'’-]+|\s+/gu;
+    let match;
+    while ((match = pattern.exec(normalized)) !== null) {
+      tokens.push(match[0]);
+    }
+    return tokens;
+  }
+
+  function isWordToken(token) {
+    return /[\p{L}\p{M}\p{N}]/u.test(token);
+  }
+
+  function resolveSourceLangCode(sourceLanguage) {
+    const key = normalizeUnicode(sourceLanguage || "")
+      .trim()
+      .toLowerCase();
+    if (key.includes("german") || key === "de" || key === "deutsch") return "de";
+    if (key.includes("french") || key === "fr" || key === "français") return "fr";
+    if (key.includes("spanish") || key === "es" || key === "español") return "es";
+    if (key.includes("italian") || key === "it" || key === "italiano") return "it";
+    if (key.includes("english") || key === "en") return "en";
+    return "";
+  }
+
+  function clearElement(element) {
+    while (element.firstChild) {
+      element.removeChild(element.firstChild);
+    }
+  }
+
+  function appendSourceToken(parent, token, hasIpa) {
+    if (isWordToken(token) && hasIpa) {
+      const span = document.createElement("span");
+      span.className = "ipa-word has-ipa";
+      span.tabIndex = 0;
+      span.textContent = token;
+      span.addEventListener("mouseenter", () => {
+        showPopover(token, span);
+      });
+      span.addEventListener("mouseleave", () => {
+        if (activePopoverWord === token) {
+          hidePopover();
+        }
+      });
+      span.addEventListener("focus", () => {
+        showPopover(token, span);
+      });
+      span.addEventListener("blur", hidePopover);
+      parent.appendChild(span);
+      return;
+    }
+    parent.appendChild(document.createTextNode(token));
+  }
+
+  function hidePopover() {
+    activePopoverWord = null;
+    ipaPopover.classList.add("hidden");
+  }
+
+  function showPopover(word, target) {
+    const ipa = ipaEntries[word];
+    if (!ipa) {
+      hidePopover();
+      return;
+    }
+    activePopoverWord = word;
+    ipaPopover.innerHTML = `<strong>${escapeHtml(word)}</strong><br /><span class="ipa-value">${escapeHtml(ipa)}</span>`;
+    ipaPopover.classList.remove("hidden");
+
+    const rect = target.getBoundingClientRect();
+    const popoverRect = ipaPopover.getBoundingClientRect();
+    let left = rect.left + rect.width / 2 - popoverRect.width / 2;
+    let top = rect.top - popoverRect.height - 8;
+    if (top < 8) {
+      top = rect.bottom + 8;
+    }
+    left = Math.max(8, Math.min(left, window.innerWidth - popoverRect.width - 8));
+    ipaPopover.style.left = `${left}px`;
+    ipaPopover.style.top = `${top}px`;
+  }
+
+  function renderPlainTextView(element, text) {
+    element.textContent = text || "[No text available]";
+  }
+
+  function renderSourceTextView(text) {
+    const normalizedText = normalizeUnicode(text);
+    clearElement(sourceTextView);
+
+    if (!normalizedText.trim()) {
+      sourceTextView.textContent = "[No source text available]";
+      return;
+    }
+
+    if (!textResultPayload || !textResultPayload.ipa_supported) {
+      sourceTextView.textContent = normalizedText;
+      return;
+    }
+
+    for (const token of tokenizeText(normalizedText)) {
+      appendSourceToken(sourceTextView, token, Boolean(isWordToken(token) && ipaEntries[token]));
+    }
+  }
+
+  function setActiveTab(tabName) {
+    const showSource = tabName === "source";
+    tabSource.classList.toggle("is-active", showSource);
+    tabTranslation.classList.toggle("is-active", !showSource);
+    tabSource.setAttribute("aria-selected", showSource ? "true" : "false");
+    tabTranslation.setAttribute("aria-selected", showSource ? "false" : "true");
+    sourceTextView.classList.toggle("hidden", !showSource);
+    translationTextView.classList.toggle("hidden", showSource);
+    hidePopover();
+  }
+
+  function uniqueWordsFromText(text) {
+    const seen = new Set();
+    const words = [];
+    for (const token of tokenizeText(text || "")) {
+      if (!isWordToken(token)) continue;
+      const key = token.toCaseFold ? token.toCaseFold() : token.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      words.push(token);
+    }
+    return words;
+  }
+
+  async function fetchIpaEntries(variant) {
+    if (!textResultPayload || !textResultPayload.ipa_supported || !window.jobConfig.jobId) {
+      ipaEntries = {};
+      return;
+    }
+    const words = uniqueWordsFromText(normalizeUnicode(textResultPayload.full_source_text));
+    if (!words.length) {
+      ipaEntries = {};
+      return;
+    }
+
+    const response = await fetch(`/api/jobs/${window.jobConfig.jobId}/ipa`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ variant, words }),
+    });
+    if (!response.ok) {
+      throw new Error("Could not load IPA pronunciations.");
+    }
+    const payload = await response.json();
+    ipaEntries = payload.entries || {};
+  }
+
+  function selectedIpaVariant() {
+    const variants = textResultPayload?.ipa_variants || [];
+    if (variants.length === 1) {
+      return variants[0].code;
+    }
+    if (ipaVariantSelect.value) {
+      return ipaVariantSelect.value;
+    }
+    return textResultPayload?.default_ipa_variant || null;
+  }
+
+  function populateVariantSelect() {
+    ipaVariantSelect.innerHTML = "";
+    const variants = textResultPayload?.ipa_variants || [];
+    variants.forEach((variant) => {
+      const option = document.createElement("option");
+      option.value = variant.code;
+      option.textContent = variant.label;
+      ipaVariantSelect.appendChild(option);
+    });
+    if (textResultPayload?.default_ipa_variant) {
+      ipaVariantSelect.value = textResultPayload.default_ipa_variant;
+    }
+  }
+
+  async function renderTextPanel() {
+    if (!textResultPayload) return;
+
+    textPanelMeta.textContent = `Source: ${textResultPayload.source_language || "Unknown"} · Target: ${textResultPayload.target_language || "Unknown"}`;
+
+    if (textResultPayload.ipa_supported) {
+      const variants = textResultPayload.ipa_variants || [];
+      if (variants.length > 1) {
+        ipaControls.classList.remove("hidden");
+        populateVariantSelect();
+      } else {
+        ipaControls.classList.add("hidden");
+      }
+      ipaUnsupportedNote.classList.add("hidden");
+      await fetchIpaEntries(selectedIpaVariant());
+    } else {
+      ipaControls.classList.add("hidden");
+      ipaUnsupportedNote.classList.remove("hidden");
+      ipaUnsupportedNote.textContent =
+        "IPA pronunciation lookup is not available for this source language.";
+      ipaEntries = {};
+    }
+
+    const sourceLang = resolveSourceLangCode(textResultPayload.source_language);
+    if (sourceLang) {
+      sourceTextView.lang = sourceLang;
+    } else {
+      sourceTextView.removeAttribute("lang");
+    }
+
+    renderSourceTextView(textResultPayload.full_source_text || "");
+    renderPlainTextView(translationTextView, normalizeUnicode(textResultPayload.full_translation || ""));
+    setActiveTab("source");
+  }
+
+  async function loadTextResult(textResultUrl) {
+    if (textResultLoaded || !textResultUrl) return;
+    textResultLoaded = true;
+    try {
+      const response = await fetch(textResultUrl, {
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) {
+        throw new Error("Could not load text review content.");
+      }
+      textResultPayload = await response.json();
+      jobLayout.classList.add("is-complete");
+      textPanel.classList.remove("hidden");
+      await renderTextPanel();
+    } catch (error) {
+      textResultLoaded = false;
+      errorArea.textContent = error.message || "Could not load text review content.";
+      errorArea.classList.remove("hidden");
+    }
+  }
+
   function renderStatus(payload) {
     statusMessage.textContent = payload.message || "Processing...";
     setProgress(payload.progress || 0);
@@ -113,6 +379,7 @@
         }
       }
       errorArea.classList.add("hidden");
+      loadTextResult(payload.text_result_url);
       stopPolling();
     } else if (payload.status === "failed") {
       const message = payload.error || "Processing failed.";
@@ -158,10 +425,23 @@
     }
   }
 
+  tabSource.addEventListener("click", () => setActiveTab("source"));
+  tabTranslation.addEventListener("click", () => setActiveTab("translation"));
+  ipaVariantSelect.addEventListener("change", async () => {
+    try {
+      await fetchIpaEntries(selectedIpaVariant());
+      renderSourceTextView(textResultPayload?.full_source_text || "");
+    } catch (error) {
+      errorArea.textContent = error.message || "Could not load IPA pronunciations.";
+      errorArea.classList.remove("hidden");
+    }
+  });
+  window.addEventListener("scroll", hidePopover, true);
+  window.addEventListener("resize", hidePopover);
+
   if (window.jobConfig.initialPayload) {
     renderStatus(window.jobConfig.initialPayload);
   }
   poll();
   timer = setInterval(poll, 1500);
 })();
-

@@ -608,17 +608,31 @@ class OpenAIService:
             if (
                 payload_kind == "translation"
                 and isinstance(parsed, dict)
-                and "full_translation" not in parsed
             ):
-                placements = parsed.get("placements")
-                fallback_lines: list[str] = []
-                if isinstance(placements, list):
-                    for item in placements:
-                        if isinstance(item, dict):
-                            text = str(item.get("translated_text", "")).strip()
-                            if text:
-                                fallback_lines.append(text)
-                parsed["full_translation"] = "\n".join(fallback_lines)
+                if "full_translation" not in parsed:
+                    placements = parsed.get("placements")
+                    fallback_lines: list[str] = []
+                    if isinstance(placements, list):
+                        for item in placements:
+                            if isinstance(item, dict):
+                                text = str(item.get("translated_text", "")).strip()
+                                if text:
+                                    fallback_lines.append(text)
+                    parsed["full_translation"] = "\n".join(fallback_lines)
+                parsed.setdefault("source_language", "")
+                parsed.setdefault("full_source_text", "")
+            if payload_kind == "canonical" and isinstance(parsed, dict):
+                parsed.setdefault("source_language", "")
+                parsed.setdefault("full_source_text", "")
+                if not parsed.get("full_source_text") and parsed.get("aligned_lines"):
+                    aligned = parsed.get("aligned_lines") or []
+                    source_lines = [
+                        str(item.get("source_text", "")).strip()
+                        for item in aligned
+                        if isinstance(item, dict) and str(item.get("source_text", "")).strip()
+                    ]
+                    if source_lines:
+                        parsed["full_source_text"] = "\n".join(source_lines)
             return schema_model.model_validate(parsed)
         except Exception as exc:
             raise TransientOpenAIError("Provider returned invalid structured output.") from exc
@@ -688,6 +702,8 @@ class OpenAIService:
         return {
             "type": "OBJECT",
             "properties": {
+                "source_language": {"type": "STRING"},
+                "full_source_text": {"type": "STRING"},
                 "target_language": {"type": "STRING"},
                 "full_translation": {"type": "STRING"},
                 "placements": {
@@ -703,7 +719,13 @@ class OpenAIService:
                     },
                 },
             },
-            "required": ["target_language", "full_translation", "placements"],
+            "required": [
+                "source_language",
+                "full_source_text",
+                "target_language",
+                "full_translation",
+                "placements",
+            ],
         }
 
     @staticmethod
@@ -711,6 +733,8 @@ class OpenAIService:
         return {
             "type": "OBJECT",
             "properties": {
+                "source_language": {"type": "STRING"},
+                "full_source_text": {"type": "STRING"},
                 "target_language": {"type": "STRING"},
                 "full_translation": {"type": "STRING"},
                 "aligned_lines": {
@@ -725,7 +749,13 @@ class OpenAIService:
                     },
                 },
             },
-            "required": ["target_language", "full_translation", "aligned_lines"],
+            "required": [
+                "source_language",
+                "full_source_text",
+                "target_language",
+                "full_translation",
+                "aligned_lines",
+            ],
         }
 
     def _to_gemini_parts(self, user_content: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:

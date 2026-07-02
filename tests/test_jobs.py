@@ -40,18 +40,20 @@ class _FakeOpenAIService:
     ):
         del (
             image_paths,
-            reasoning_effort,
             position_variant,
             system_prompt_override,
             user_header_override,
             extra_user_text_blocks,
         )
+        resolved_reasoning_effort = reasoning_effort
         self.active_calls += 1
         self.max_active_calls = max(self.max_active_calls, self.active_calls)
         await asyncio.sleep(0.05)
         self.active_calls -= 1
 
         result = TranslationResult(
+            source_language="Latin",
+            full_source_text="Kyrie eleison",
             target_language=target_language,
             full_translation=f"full-batch-{batch.index}",
             placements=[
@@ -66,7 +68,7 @@ class _FakeOpenAIService:
             batch_index=batch.index,
             provider=provider,
             model=model_name or "default",
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=resolved_reasoning_effort,
             owned_pages=list(batch.owned_pages),
             supplied_pages=list(batch.supplied_pages),
             pages_sent_count=len(list(batch.supplied_pages)),
@@ -136,9 +138,12 @@ class _CanonicalOpenAIService(_CountingOpenAIService):
         position_variant: str,
         user_header_override: str | None = None,
     ):
-        del image_paths, provider, model_name, reasoning_effort, position_variant, user_header_override
+        del image_paths, provider, model_name, position_variant, user_header_override
+        resolved_reasoning_effort = reasoning_effort
         self.canonical_calls += 1
         result = CanonicalTranslationResult(
+            source_language="Italian",
+            full_source_text="Prima linea\nSecunda linea",
             target_language=target_language,
             full_translation="Canonical line one\nCanonical line two",
             aligned_lines=[
@@ -156,7 +161,7 @@ class _CanonicalOpenAIService(_CountingOpenAIService):
             batch_index=batch.index,
             provider=LLM_PROVIDER_OPENAI,
             model="default",
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=resolved_reasoning_effort,
             owned_pages=list(batch.owned_pages),
             supplied_pages=list(batch.supplied_pages),
             pages_sent_count=len(list(batch.supplied_pages)),
@@ -223,11 +228,18 @@ def test_process_job_runs_batches_concurrently_and_keeps_log_order(tmp_path, mon
         position_order: dict[str, int],
         placement_groups,
         full_translations,
+        full_source_texts=None,
+        source_language=None,
         full_translation_override=None,
+        full_source_text_override=None,
+        source_language_override=None,
     ):
-        del position_order
+        del position_order, full_source_texts
+        resolved_source_language = source_language_override or source_language or "Latin"
         merged = [placement for group in placement_groups for placement in group]
         return TranslationResult(
+            source_language=resolved_source_language,
+            full_source_text=full_source_text_override or "Source text",
             target_language=target_language,
             full_translation=full_translation_override or "\n".join(full_translations),
             placements=merged,
@@ -257,6 +269,10 @@ def test_process_job_runs_batches_concurrently_and_keeps_log_order(tmp_path, mon
     completed_manifest = job_store.require_job(manifest.job_id)
     assert completed_manifest.status == JobStatus.COMPLETE
     assert fake_openai_service.max_active_calls > 1
+    text_result = job_store.load_text_result(manifest.job_id)
+    assert text_result is not None
+    assert text_result.source_language == "Latin"
+    assert text_result.full_source_text
 
     llm_log_payload = json.loads(job_store.llm_log_json_path(manifest.job_id).read_text(encoding="utf-8"))
     assert [entry["batch_index"] for entry in llm_log_payload["entries"]] == [1, 2, 3]
@@ -311,11 +327,18 @@ def test_process_job_resumes_from_saved_batch_checkpoints(tmp_path, monkeypatch)
         position_order: dict[str, int],
         placement_groups,
         full_translations,
+        full_source_texts=None,
+        source_language=None,
         full_translation_override=None,
+        full_source_text_override=None,
+        source_language_override=None,
     ):
-        del position_order
+        del position_order, full_source_texts
+        resolved_source_language = source_language_override or source_language or "Latin"
         merged = [placement for group in placement_groups for placement in group]
         return TranslationResult(
+            source_language=resolved_source_language,
+            full_source_text=full_source_text_override or "Source text",
             target_language=target_language,
             full_translation=full_translation_override or "\n".join(full_translations),
             placements=merged,
@@ -364,6 +387,8 @@ def test_process_job_resumes_from_saved_batch_checkpoints(tmp_path, monkeypatch)
             )
         ],
         full_translation="full-batch-1",
+        full_source_text="Source batch 1",
+        source_language="Latin",
         batch_log=checkpoint_log,
     )
 
@@ -427,11 +452,18 @@ def test_process_job_canonical_workflow_runs_initial_pass(tmp_path, monkeypatch)
         position_order: dict[str, int],
         placement_groups,
         full_translations,
+        full_source_texts=None,
+        source_language=None,
         full_translation_override=None,
+        full_source_text_override=None,
+        source_language_override=None,
     ):
-        del position_order
+        del position_order, full_source_texts
+        resolved_source_language = source_language_override or source_language or "Latin"
         merged = [placement for group in placement_groups for placement in group]
         return TranslationResult(
+            source_language=resolved_source_language,
+            full_source_text=full_source_text_override or "Source text",
             target_language=target_language,
             full_translation=full_translation_override or "\n".join(full_translations),
             placements=merged,
@@ -461,6 +493,10 @@ def test_process_job_canonical_workflow_runs_initial_pass(tmp_path, monkeypatch)
     assert completed_manifest.status == JobStatus.COMPLETE
     assert fake_openai_service.canonical_calls == 1
     assert fake_openai_service.called_batches == [1, 2]
+    text_result = job_store.load_text_result(manifest.job_id)
+    assert text_result is not None
+    assert text_result.source_language == "Italian"
+    assert "Prima linea" in text_result.full_source_text
 
     llm_log_payload = json.loads(job_store.llm_log_json_path(manifest.job_id).read_text(encoding="utf-8"))
     assert [entry["batch_index"] for entry in llm_log_payload["entries"]] == [0, 1, 2]

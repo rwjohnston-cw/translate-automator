@@ -23,6 +23,7 @@ from app.models import (
     JobLLMLog,
     JobManifest,
     JobStatus,
+    JobTextResult,
     TRANSLATION_WORKFLOW_CANONICAL,
     TranslationPlacement,
     positions_for_variant,
@@ -84,6 +85,9 @@ class JobStore:
     def translation_json_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "translation.json"
 
+    def text_result_json_path(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "text_result.json"
+
     def llm_log_json_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "llm_log.json"
 
@@ -107,6 +111,9 @@ class JobStore:
 
     def _redis_input_key(self, job_id: str) -> str:
         return f"{self.redis_key_prefix}:job:{job_id}:input_pdf"
+
+    def _redis_text_result_key(self, job_id: str) -> str:
+        return f"{self.redis_key_prefix}:job:{job_id}:text_result"
 
     def _redis_canonical_key(self, job_id: str) -> str:
         return f"{self.redis_key_prefix}:job:{job_id}:canonical_translation"
@@ -321,6 +328,9 @@ class JobStore:
     def mark_log_available(self, *, job_id: str) -> JobManifest:
         return self.update_job(job_id, log_available=True)
 
+    def mark_text_result_available(self, *, job_id: str) -> JobManifest:
+        return self.update_job(job_id, text_result_available=True)
+
     def mark_failed(self, *, job_id: str, message: str) -> JobManifest:
         manifest = self.update_job(
             job_id,
@@ -419,6 +429,56 @@ class JobStore:
             LOGGER.exception("Failed to read llm log artifact from redis job_id=%s", job_id)
             return None
 
+    def save_text_result(self, *, job_id: str, text_result: JobTextResult) -> None:
+        path = self.text_result_json_path(job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = text_result.model_dump_json(indent=2).encode("utf-8")
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_bytes(payload)
+        tmp_path.replace(path)
+
+        if self.redis_client is None:
+            return
+        manifest = self.get_job(job_id)
+        if manifest is None:
+            return
+        try:
+            self.redis_client.set(
+                self._redis_text_result_key(job_id),
+                payload,
+                ex=self._redis_ttl_seconds(manifest),
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist text result to redis job_id=%s", job_id)
+
+    def load_text_result(self, job_id: str) -> JobTextResult | None:
+        path = self.text_result_json_path(job_id)
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return JobTextResult.model_validate(payload)
+            except Exception:
+                LOGGER.exception("Failed to parse text result path=%s", path)
+
+        if self.redis_client is None:
+            return None
+        try:
+            cached = self.redis_client.get(self._redis_text_result_key(job_id))
+        except Exception:
+            LOGGER.exception("Failed to read text result from redis job_id=%s", job_id)
+            return None
+        if cached is None:
+            return None
+        try:
+            payload = json.loads(cached.decode("utf-8"))
+            text_result = JobTextResult.model_validate(payload)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text_result.model_dump_json(indent=2), encoding="utf-8")
+            return text_result
+        except Exception:
+            LOGGER.exception("Failed to parse cached text result job_id=%s", job_id)
+            return None
+
     def save_canonical_translation(
         self,
         *,
@@ -502,6 +562,8 @@ class JobStore:
         owned_end: int,
         placements: list[TranslationPlacement],
         full_translation: str,
+        full_source_text: str = "",
+        source_language: str = "",
         batch_log: BatchLLMLogEntry,
     ) -> None:
         payload = {
@@ -510,6 +572,8 @@ class JobStore:
             "owned_end": owned_end,
             "placements": [item.model_dump() for item in placements],
             "full_translation": full_translation,
+            "full_source_text": full_source_text,
+            "source_language": source_language,
             "batch_log": batch_log.model_dump(),
         }
         manifest = self.get_job(job_id)
@@ -539,25 +603,35 @@ class JobStore:
 
     def _parse_checkpoint_payload(
         self, payload: dict[str, Any]
-    ) -> tuple[int, list[TranslationPlacement], str, BatchLLMLogEntry]:
+    ) -> tuple[int, list[TranslationPlacement], str, str, str, BatchLLMLogEntry]:
         batch_index = int(payload["batch_index"])
         placements_raw = payload.get("placements") or []
         placements = [TranslationPlacement.model_validate(item) for item in placements_raw]
         full_translation = str(payload.get("full_translation") or "")
+        full_source_text = str(payload.get("full_source_text") or "")
+        source_language = str(payload.get("source_language") or "")
         batch_log = BatchLLMLogEntry.model_validate(payload["batch_log"])
-        return batch_index, placements, full_translation, batch_log
+        return batch_index, placements, full_translation, full_source_text, source_language, batch_log
 
     def load_batch_checkpoints(
         self, job_id: str
-    ) -> dict[int, tuple[list[TranslationPlacement], str, BatchLLMLogEntry]]:
-        checkpoints: dict[int, tuple[list[TranslationPlacement], str, BatchLLMLogEntry]] = {}
+    ) -> dict[int, tuple[list[TranslationPlacement], str, str, str, BatchLLMLogEntry]]:
+        checkpoints: dict[int, tuple[list[TranslationPlacement], str, str, str, BatchLLMLogEntry]] = {}
         checkpoint_dir = self.checkpoint_dir(job_id)
         if checkpoint_dir.exists():
             for path in sorted(checkpoint_dir.glob("batch_*.json")):
                 try:
                     payload = json.loads(path.read_text(encoding="utf-8"))
-                    index, placements, full_translation, batch_log = self._parse_checkpoint_payload(payload)
-                    checkpoints[index] = (placements, full_translation, batch_log)
+                    index, placements, full_translation, full_source_text, source_language, batch_log = (
+                        self._parse_checkpoint_payload(payload)
+                    )
+                    checkpoints[index] = (
+                        placements,
+                        full_translation,
+                        full_source_text,
+                        source_language,
+                        batch_log,
+                    )
                 except Exception:
                     LOGGER.exception("Failed to parse local checkpoint path=%s", path)
 
@@ -572,9 +646,17 @@ class JobStore:
         for raw_index, raw_payload in raw_map.items():
             try:
                 payload = json.loads(raw_payload.decode("utf-8"))
-                index, placements, full_translation, batch_log = self._parse_checkpoint_payload(payload)
+                index, placements, full_translation, full_source_text, source_language, batch_log = (
+                    self._parse_checkpoint_payload(payload)
+                )
                 if index not in checkpoints:
-                    checkpoints[index] = (placements, full_translation, batch_log)
+                    checkpoints[index] = (
+                        placements,
+                        full_translation,
+                        full_source_text,
+                        source_language,
+                        batch_log,
+                    )
             except Exception:
                 LOGGER.exception(
                     "Failed to parse redis checkpoint job_id=%s batch=%s",
@@ -631,6 +713,12 @@ def _sort_batch_placements(
 def _canonical_reference_text(canonical: CanonicalTranslationResult) -> str:
     lines: list[str] = [
         "CANONICAL_TRANSLATION_REFERENCE",
+        "",
+        "SOURCE_LANGUAGE:",
+        canonical.source_language or "[unknown]",
+        "",
+        "FULL_SOURCE_TEXT:",
+        canonical.full_source_text or "[empty]",
         "",
         "FULL_TRANSLATION:",
         canonical.full_translation or "[empty]",
@@ -799,6 +887,8 @@ async def process_job(
         llm_entries_by_index: dict[int, BatchLLMLogEntry] = {}
         placement_groups_by_index: dict[int, list[TranslationPlacement]] = {}
         full_translations_by_index: dict[int, str] = {}
+        full_source_texts_by_index: dict[int, str] = {}
+        source_languages_by_index: dict[int, str] = {}
         analysis_base_progress = 0.40 if is_canonical_mode else 0.25
         analysis_span = 0.45 if is_canonical_mode else 0.60
 
@@ -852,9 +942,17 @@ async def process_job(
             )
 
         checkpoints = job_store.load_batch_checkpoints(job_id)
-        for checkpoint_index, (placements, full_translation, batch_log) in checkpoints.items():
+        for checkpoint_index, (
+            placements,
+            full_translation,
+            full_source_text,
+            source_language,
+            batch_log,
+        ) in checkpoints.items():
             placement_groups_by_index[checkpoint_index] = placements
             full_translations_by_index[checkpoint_index] = full_translation
+            full_source_texts_by_index[checkpoint_index] = full_source_text
+            source_languages_by_index[checkpoint_index] = source_language
             llm_entries_by_index[checkpoint_index] = batch_log
 
         pending_batches = [batch for batch in batches if batch.index not in placement_groups_by_index]
@@ -869,7 +967,7 @@ async def process_job(
 
         async def _run_single_batch(
             batch_spec,
-        ) -> tuple[int, int, int, list[TranslationPlacement], str, BatchLLMLogEntry]:
+        ) -> tuple[int, int, int, list[TranslationPlacement], str, str, str, BatchLLMLogEntry]:
             LOGGER.info(
                 "Running batch job_id=%s batch=%s owned=%s-%s supplied=%s-%s",
                 job_id,
@@ -916,6 +1014,16 @@ async def process_job(
                     if is_canonical_mode and canonical_result is not None
                     else batch_result.full_translation
                 ),
+                (
+                    canonical_result.full_source_text
+                    if is_canonical_mode and canonical_result is not None
+                    else batch_result.full_source_text
+                ),
+                (
+                    canonical_result.source_language
+                    if is_canonical_mode and canonical_result is not None
+                    else batch_result.source_language
+                ),
                 batch_log,
             )
 
@@ -935,7 +1043,9 @@ async def process_job(
             if pending_batches:
                 semaphore = asyncio.Semaphore(max_parallel_batches)
                 tasks: list[
-                    asyncio.Task[tuple[int, int, int, list[TranslationPlacement], str, BatchLLMLogEntry]]
+                    asyncio.Task[
+                        tuple[int, int, int, list[TranslationPlacement], str, str, str, BatchLLMLogEntry]
+                    ]
                 ] = []
 
                 async def _run_with_limit(batch_spec):
@@ -951,6 +1061,8 @@ async def process_job(
                             owned_end,
                             sorted_placements,
                             full_translation,
+                            full_source_text,
+                            source_language,
                             batch_log,
                         ) = await completed_task
                         job_store.save_batch_checkpoint(
@@ -960,10 +1072,14 @@ async def process_job(
                             owned_end=owned_end,
                             placements=sorted_placements,
                             full_translation=full_translation,
+                            full_source_text=full_source_text,
+                            source_language=source_language,
                             batch_log=batch_log,
                         )
                         placement_groups_by_index[batch_index] = sorted_placements
                         full_translations_by_index[batch_index] = full_translation
+                        full_source_texts_by_index[batch_index] = full_source_text
+                        source_languages_by_index[batch_index] = source_language
                         llm_entries_by_index[batch_index] = batch_log
                         completed_batches += 1
                         batch_progress = (
@@ -986,16 +1102,31 @@ async def process_job(
         ordered_batch_indexes = sorted(placement_groups_by_index)
         placement_groups = [placement_groups_by_index[index] for index in ordered_batch_indexes]
         full_translations = [full_translations_by_index.get(index, "") for index in ordered_batch_indexes]
-        llm_entry_indexes = sorted(llm_entries_by_index)
-        llm_entries = [llm_entries_by_index[index] for index in llm_entry_indexes]
+        full_source_texts = [full_source_texts_by_index.get(index, "") for index in ordered_batch_indexes]
+        resolved_source_language = next(
+            (value.strip() for value in source_languages_by_index.values() if value and value.strip()),
+            "",
+        )
 
         merged = merge_batch_results(
             target_language=manifest.target_language,
             position_order=position_order,
             placement_groups=placement_groups,
             full_translations=full_translations,
+            full_source_texts=full_source_texts,
+            source_language=resolved_source_language,
             full_translation_override=(
                 canonical_result.full_translation
+                if is_canonical_mode and canonical_result is not None
+                else None
+            ),
+            full_source_text_override=(
+                canonical_result.full_source_text
+                if is_canonical_mode and canonical_result is not None
+                else None
+            ),
+            source_language_override=(
+                canonical_result.source_language
                 if is_canonical_mode and canonical_result is not None
                 else None
             ),
@@ -1004,11 +1135,23 @@ async def process_job(
             merged.model_dump_json(indent=2),
             encoding="utf-8",
         )
+        job_store.save_text_result(
+            job_id=job_id,
+            text_result=JobTextResult(
+                source_language=merged.source_language,
+                full_source_text=merged.full_source_text,
+                target_language=merged.target_language,
+                full_translation=merged.full_translation,
+            ),
+        )
+        job_store.mark_text_result_available(job_id=job_id)
         LOGGER.info(
             "Merged translation job_id=%s total_placements=%s",
             job_id,
             len(merged.placements),
         )
+        llm_entry_indexes = sorted(llm_entries_by_index)
+        llm_entries = [llm_entries_by_index[index] for index in llm_entry_indexes]
         total_input_tokens = sum(entry.input_tokens or 0 for entry in llm_entries)
         total_output_tokens = sum(entry.output_tokens or 0 for entry in llm_entries)
         total_tokens = sum(entry.total_tokens or 0 for entry in llm_entries)

@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from app.models import JobStatus, JobTextResult
 
 
 def _build_client(tmp_path: Path, **overrides: object) -> TestClient:
@@ -193,4 +194,117 @@ def test_rate_limit_uses_forwarded_ip(tmp_path: Path, make_pdf_bytes):
     assert first.status_code == 200
     assert second_same_ip.status_code == 429
     assert third_other_ip.status_code == 200
+
+
+def test_text_result_and_ipa_endpoints(tmp_path: Path):
+    settings = Settings(
+        openai_api_key="sk-test",
+        max_upload_mb=1,
+        max_pages=100,
+        job_root=tmp_path / "jobs",
+        cleanup_interval_seconds=3600,
+    )
+    app = create_app(settings=settings)
+    client = TestClient(app)
+    store = app.state.job_store
+    manifest = store.create_job(
+        original_filename="score.pdf",
+        target_language="English",
+        page_count=1,
+        llm_provider="openai",
+        llm_model=None,
+        llm_reasoning_effort=None,
+        translation_workflow="batch_translate_and_place",
+        positioning_variant="standard_3",
+        testing_mode=False,
+    )
+    store.update_job(
+        manifest.job_id,
+        status=JobStatus.COMPLETE,
+        output_available=True,
+        text_result_available=True,
+    )
+    store.save_text_result(
+        job_id=manifest.job_id,
+        text_result=JobTextResult(
+            source_language="German",
+            full_source_text="Guten Tag Welt",
+            target_language="English",
+            full_translation="Good day world",
+        ),
+    )
+
+    status_response = client.get(f"/api/jobs/{manifest.job_id}")
+    assert status_response.status_code == 200
+    assert status_response.json()["text_result_url"] == f"/api/jobs/{manifest.job_id}/text-result"
+
+    text_result_response = client.get(f"/api/jobs/{manifest.job_id}/text-result")
+    assert text_result_response.status_code == 200
+    payload = text_result_response.json()
+    assert payload["source_language"] == "German"
+    assert payload["full_source_text"] == "Guten Tag Welt"
+    assert payload["ipa_supported"] is True
+    assert payload["default_ipa_variant"] == "de"
+
+    ipa_response = client.post(
+        f"/api/jobs/{manifest.job_id}/ipa",
+        json={"variant": "de", "words": ["Guten", "Welt", "missing"]},
+    )
+    assert ipa_response.status_code == 200
+    ipa_payload = ipa_response.json()
+    assert ipa_payload["ipa_supported"] is True
+    assert ipa_payload["variant"] == "de"
+    assert "entries" in ipa_payload
+
+    client.close()
+
+
+def test_ipa_endpoint_reports_unsupported_language(tmp_path: Path):
+    settings = Settings(
+        openai_api_key="sk-test",
+        max_upload_mb=1,
+        max_pages=100,
+        job_root=tmp_path / "jobs",
+        cleanup_interval_seconds=3600,
+    )
+    app = create_app(settings=settings)
+    client = TestClient(app)
+    store = app.state.job_store
+    manifest = store.create_job(
+        original_filename="score.pdf",
+        target_language="English",
+        page_count=1,
+        llm_provider="openai",
+        llm_model=None,
+        llm_reasoning_effort=None,
+        translation_workflow="batch_translate_and_place",
+        positioning_variant="standard_3",
+        testing_mode=False,
+    )
+    store.update_job(
+        manifest.job_id,
+        status=JobStatus.COMPLETE,
+        text_result_available=True,
+    )
+    store.save_text_result(
+        job_id=manifest.job_id,
+        text_result=JobTextResult(
+            source_language="Latin",
+            full_source_text="Kyrie eleison",
+            target_language="English",
+            full_translation="Lord have mercy",
+        ),
+    )
+
+    text_result_response = client.get(f"/api/jobs/{manifest.job_id}/text-result")
+    assert text_result_response.status_code == 200
+    assert text_result_response.json()["ipa_supported"] is False
+
+    ipa_response = client.post(
+        f"/api/jobs/{manifest.job_id}/ipa",
+        json={"words": ["Kyrie"]},
+    )
+    assert ipa_response.status_code == 200
+    assert ipa_response.json()["ipa_supported"] is False
+    client.close()
 

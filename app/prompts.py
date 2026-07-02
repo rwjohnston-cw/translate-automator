@@ -100,6 +100,10 @@ Return data matching the supplied structured output schema.
 
 The target_language field must repeat the requested target language.
 
+The source_language field must identify the language of the original sung text as read from the score (for example Latin, Italian, German, English).
+
+The full_source_text field must contain the complete reconstructed source-language poem/text for the owned pages as continuous readable text, preserving intended line breaks and stanza breaks.
+
 The full_translation field must contain the complete translated poem/text for the owned pages as continuous readable text, preserving intended line breaks and stanza breaks.
 
 Each placement must contain:
@@ -195,6 +199,8 @@ Rules:
 - If text is unclear, use "[unclear]" rather than inventing words.
 
 Output schema rules:
+- source_language: identify the language of the original sung text from the score.
+- full_source_text: reconstructed source-language poem/text only, preserving intended line and stanza breaks.
 - target_language: repeat requested target language.
 - full_translation: translated poem/text only (target language), preserving intended line and stanza breaks.
 - aligned_lines: line-by-line mapping from reconstructed source line to translated line.
@@ -229,6 +235,8 @@ Placement rules:
 - Repeat text only for genuinely separate later musical events.
 
 Structured output:
+- source_language: copy the canonical source language exactly.
+- full_source_text: copy the canonical full source text exactly (verbatim).
 - target_language: requested target language.
 - full_translation: copy the canonical full translation exactly (verbatim).
 - placements: page/position/translated_text entries ordered by page then position reading order.

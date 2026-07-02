@@ -117,6 +117,24 @@ def build_dynamic_response_model(allowed_positions: Sequence[str]) -> type[BaseM
     )
     return create_model(
         "DynamicTranslationResult",
+        source_language=(
+            str,
+            Field(
+                description=(
+                    "The language of the original sung text as identified from the score "
+                    "(e.g. Latin, Italian, German)."
+                )
+            ),
+        ),
+        full_source_text=(
+            str,
+            Field(
+                description=(
+                    "Complete reconstructed source-language poem/text for the owned pages, "
+                    "preserving intended line breaks and stanza breaks."
+                )
+            ),
+        ),
         target_language=(str, ...),
         full_translation=(
             str,
@@ -145,13 +163,15 @@ class TranslationPlacement(BaseModel):
 
 
 class TranslationResult(BaseModel):
+    source_language: str = ""
+    full_source_text: str = ""
     target_language: str
     full_translation: str = ""
     placements: list[TranslationPlacement]
 
-    @field_validator("full_translation")
+    @field_validator("full_source_text", "full_translation")
     @classmethod
-    def _normalize_full_translation(cls, value: str) -> str:
+    def _normalize_multiline_text(cls, value: str) -> str:
         return value.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
@@ -170,6 +190,12 @@ class CanonicalTranslationLine(BaseModel):
 
 
 class CanonicalTranslationResult(BaseModel):
+    source_language: str = Field(
+        description="The language of the original sung text as identified from the score."
+    )
+    full_source_text: str = Field(
+        description="Complete reconstructed source-language text with intended poetic line breaks."
+    )
     target_language: str
     full_translation: str = Field(
         description="Complete target-language translation with intended poetic line breaks."
@@ -181,10 +207,19 @@ class CanonicalTranslationResult(BaseModel):
         )
     )
 
-    @field_validator("full_translation")
+    @field_validator("full_source_text", "full_translation")
     @classmethod
-    def _normalize_full_translation(cls, value: str) -> str:
+    def _normalize_multiline_text(cls, value: str) -> str:
         return value.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+class JobTextResult(BaseModel):
+    """Source and translation text persisted for the job completion panel."""
+
+    source_language: str = ""
+    full_source_text: str = ""
+    target_language: str = ""
+    full_translation: str = ""
 
 
 class BatchLLMLogEntry(BaseModel):
@@ -242,6 +277,7 @@ class JobManifest(BaseModel):
     download_filename: str | None = None
     output_available: bool = False
     log_available: bool = False
+    text_result_available: bool = False
     original_filename: str
     safe_original_stem: str
     target_language: str
